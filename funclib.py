@@ -1,10 +1,28 @@
 import numpy as np
-from sklearn.cluster import KMeans
+import cv2
 
 '''
 Functions for the machine learning segmentation of various solar features
 '''
 
+def add_kernel_feats(df, data):
+    df_new = df.copy()
+    k1 = np.array([[1, 1, 1],  # blur (maybe usefull?)
+                [1, 1, 1],
+                [1, 1, 1]])/9
+    k2 = np.array([[0, -1, 0],  # sharpening (probably not usefull?)
+                [-1, 5, -1],
+                [0, -1, 0]])
+    k3 = np.array([[-1, -1, -1],  # edge detection (probably not usefull?)
+                [-1, 8, -1],
+                [-1, -1, -1]])
+    kernels = [k1, k2, k3]
+    for i in range(len(kernels)):
+        kernel = kernels[i]
+        filtered_img = cv2.filter2D(data, -1, kernel).reshape(-1) # filtered_img = cv2.GaussianBlur(data, (5,5), 0)#.reshape(-1)
+        # fig, (ax1, ax2) = plt.subplots(1,2); ax1.imshow(data); ax2.imshow(filtered_img)
+        df['kernal'+str(i)] = filtered_img
+    return df_new
 
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
