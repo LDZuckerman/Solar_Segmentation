@@ -7,7 +7,6 @@ Functions for the machine learning segmentation of various solar features
 
 
 
-
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
 
