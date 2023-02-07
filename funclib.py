@@ -1,11 +1,14 @@
 import numpy as np
 import cv2
+import sunpy
+import scipy.ndimage as sndi
+import skimage
 
 '''
 Functions for the machine learning segmentation of various solar features
 '''
 
-def add_kernel_feats(df, data):
+def add_kernel_feats(df, dataflat):
     df_new = df.copy()
     k1 = np.array([[1, 1, 1],  # blur (maybe usefull?)
                 [1, 1, 1],
@@ -19,13 +22,64 @@ def add_kernel_feats(df, data):
     kernels = [k1, k2, k3]
     for i in range(len(kernels)):
         kernel = kernels[i]
-        filtered_img = cv2.filter2D(data, -1, kernel).reshape(-1) # filtered_img = cv2.GaussianBlur(data, (5,5), 0)#.reshape(-1)
+        filtered_img = cv2.filter2D(dataflat, -1, kernel).reshape(-1) # filtered_img = cv2.GaussianBlur(data, (5,5), 0)#.reshape(-1)
         # fig, (ax1, ax2) = plt.subplots(1,2); ax1.imshow(data); ax2.imshow(filtered_img)
-        df['kernal'+str(i)] = filtered_img
+        df_new['kernal'+str(i)] = filtered_img
+    return df_new
+
+def add_gradient_feats(df, data):
+    # Attempted to use cv2.Laplacian, but require dtype uint8, and converting cuased issues with the normalization #cv2.Laplacian(data,cv2.CV_64F).reshape(-1)
+    df_new = df.copy()
+    df_new['gradienty'] = np.gradient(data)[0].reshape(-1)
+    df_new['gradienty'] = np.gradient(data)[1].reshape(-1)
     return df_new
 
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
+
+def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False):
+    """
+    Segment an optical image of the solar photosphere into tri-value maps with:
+
+     * 0 as intergranule
+     * 0.5 as faculae
+     * 1 as granule
+
+    Parameters
+    ----------
+    smap : `numpy.ndarray`
+        NumPy array containing data to segment.
+    resolution : `float`
+        Spatial resolution (arcsec/pixel) of the data.
+    skimage_method : {"li", "otsu", "isodata", "mean", "minimum", "yen", "triangle"}
+        scikit-image thresholding method, defaults to "li".
+        Depending on input data, one or more of these methods may be
+        significantly better or worse than the others. Typically, 'li', 'otsu',
+        'mean', and 'isodata' are good choices, 'yen' and 'triangle' over-
+        identify intergranule material, and 'minimum' over identifies granules.
+    mark_dim_centers : `bool`
+        Whether to mark dim granule centers as a separate category for future exploration.
+
+    Returns
+    -------
+    segmented_map : `numpy.ndarrray`
+        NumPy array containing a segmented image (with the original header).
+    """
+
+    # if skimage_method not in METHODS:
+    #     raise TypeError("Method must be one of: " + ", ".join(METHODS))
+
+    median_filtered = sndi.median_filter(map, size=3)
+    # Apply initial skimage threshold.
+    threshold = get_threshold(median_filtered, skimage_method)
+    segmented_image = np.uint8(median_filtered > threshold)
+    # Fix the extra intergranule material bits in the middle of granules.
+    seg_im_fixed = trim_intergranules(segmented_image, mark=mark_dim_centers)
+    # Mark faculae and get final granule and facule count.
+    seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution)
+    # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
+    segmented_map = seg_im_markfac
+    return segmented_map
 
 
 def segment(smap, resolution, *, skimage_method="li", mark_dim_centers=False):
@@ -106,8 +160,8 @@ def get_threshold(data, method):
         threshold = skimage.filters.threshold_triangle(data)
     elif method == "isodata":
         threshold = skimage.filters.threshold_isodata(data)
-    else:
-        raise ValueError("Method must be one of: " + ", ".join(METHODS))
+    # else:
+    #     raise ValueError("Method must be one of: " + ", ".join(METHODS))
     return threshold
 
 
