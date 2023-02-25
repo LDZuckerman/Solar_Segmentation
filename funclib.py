@@ -3,6 +3,8 @@ import cv2
 import sunpy
 import scipy.ndimage as sndi
 import skimage
+import pandas as pd
+from sklearn import preprocessing
 
 '''
 Functions for the machine learning segmentation of various solar features
@@ -10,13 +12,13 @@ Functions for the machine learning segmentation of various solar features
 
 def add_kernel_feats(df, dataflat):
     df_new = df.copy()
-    k1 = np.array([[1, 1, 1],  # blur (maybe usefull?)
+    k1 = np.array([[1, 1, 1],  # blur (maybe useful?)
                 [1, 1, 1],
                 [1, 1, 1]])/9
-    k2 = np.array([[0, -1, 0],  # sharpening (probably not usefull?)
+    k2 = np.array([[0, -1, 0],  # sharpening (probably not useful?)
                 [-1, 5, -1],
                 [0, -1, 0]])
-    k3 = np.array([[-1, -1, -1],  # edge detection (probably not usefull?)
+    k3 = np.array([[-1, -1, -1],  # edge detection (probably not useful?)
                 [-1, 8, -1],
                 [-1, -1, -1]])
     kernels = [k1, k2, k3]
@@ -24,21 +26,73 @@ def add_kernel_feats(df, dataflat):
         kernel = kernels[i]
         filtered_img = cv2.filter2D(dataflat, -1, kernel).reshape(-1) # filtered_img = cv2.GaussianBlur(data, (5,5), 0)#.reshape(-1)
         # fig, (ax1, ax2) = plt.subplots(1,2); ax1.imshow(data); ax2.imshow(filtered_img)
-        df_new['kernal'+str(i)] = filtered_img
+        df_new['kernel'+str(i)] = filtered_img
     return df_new
 
 def add_gradient_feats(df, data):
-    # Attempted to use cv2.Laplacian, but require dtype uint8, and converting cuased issues with the normalization #cv2.Laplacian(data,cv2.CV_64F).reshape(-1)
+    # Attempted to use cv2.Laplacian, but require dtype uint8, and converting caused issues with the normalization #cv2.Laplacian(data,cv2.CV_64F).reshape(-1)
     df_new = df.copy()
     df_new['gradienty'] = np.gradient(data)[0].reshape(-1)
-    df_new['gradienty'] = np.gradient(data)[1].reshape(-1)
+    df_new['gradientx'] = np.gradient(data)[1].reshape(-1)
     return df_new
+
+def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
+    # Flatten features and labels
+    dataflat = data.reshape(-1)
+    labelsflat = labels.reshape(-1)
+    # Put features and labels into df
+    df = pd.DataFrame()
+    df['OG_value'] = dataflat
+    df = add_kernel_feats(df, dataflat) # Add values of different filters as features
+    df = add_gradient_feats(df, data) # Add value of gradient as feature
+    df['labels'] =  labelsflat
+    # Make X and Y
+    X =  df.drop(labels =["labels"], axis=1)
+    Y = df['labels']
+    Y = preprocessing.LabelEncoder().fit_transform(Y) # turn floats 0, 1, to categorical 0, 1
+    return X, Y
+
+def post_process(preds):
+    if len(np.unique(preds)) == 2:
+        preds = np.copy(preds).astype(float)  # Float conversion for correct region labeling.
+        preds2 = np.ones_like(preds)*20 # Just to aviod issues later on 
+        labeled_preds = skimage.measure.label(preds + 1, connectivity=2)
+        values = np.unique(labeled_preds)
+        # Find value of the largest region (IG region)
+        size = 0
+        for value in values:
+            if len((labeled_preds[labeled_preds == value])) > size:
+                IG_value = value
+                size = len(labeled_preds[labeled_preds == value])
+        # Where labeled_preds=IG_value set preds2 to zero, otherwise 1
+        preds2[labeled_preds == IG_value] = 0
+        preds2[labeled_preds != IG_value] = 1  
+    else: print('NOT YET IMPLEMENTED: NEED TO FIND A WAY TO GET 3-VALUE SEG INTO FORM CMPARABLE TO LABELS'); a=b
+    # uniques = np.unique(preds)
+    # preds2 = np.copy(preds)
+    # if  len(uniques) == 2:
+    #     # assign the continuous region to be 0s
+    #     flat = preds.reshape(-1)
+    #     if len(np.where(flat == uniques[0])[0]) > len(np.where(flat == uniques[1])[0]):
+    #         preds2[np.where(preds==uniques[0])] == 0
+    #         preds2[np.where(preds==uniques[1])] == 1
+    #     elif len(np.where(flat == uniques[0])[0]) < len(np.where(flat == uniques[1])[0]):
+    #         preds2[np.where(preds==uniques[0])] == 1
+    #         preds2[np.where(preds==uniques[1])] == 0
+    #     else: print(''); a=b
+    # else: 
+    #     print('NOT YET IMPLEMENTED: NEED TO FIND A WAY TO GET 3-VALUE SEG INTO FORM CMPARABLE TO LABELS')
+    #     a=b
+    return preds2
 
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
-def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False):
+def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True):
     """
+    SIMILAR BUT NOT IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE, BUT 
+    WITH SMALL MODIFICATIONS, E.G.,RE-ADDITION OF MARK_FAC FLAG
+
     Segment an optical image of the solar photosphere into tri-value maps with:
 
      * 0 as intergranule
@@ -62,7 +116,7 @@ def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=Fals
 
     Returns
     -------
-    segmented_map : `numpy.ndarrray`
+    segmented_map : `numpy.ndarray`
         NumPy array containing a segmented image (with the original header).
     """
 
@@ -76,7 +130,8 @@ def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=Fals
     # Fix the extra intergranule material bits in the middle of granules.
     seg_im_fixed = trim_intergranules(segmented_image, mark=mark_dim_centers)
     # Mark faculae and get final granule and facule count.
-    seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution)
+    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution)
+    else: seg_im_markfac = seg_im_fixed
     # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
     segmented_map = seg_im_markfac
     return segmented_map
@@ -185,8 +240,7 @@ def trim_intergranules(segmented_image, mark=False):
     """
     if len(np.unique(segmented_image)) > 2:
         raise ValueError("segmented_image must only have values of 1 and 0.")
-    # Float conversion for correct region labeling.
-    segmented_image_fixed = np.copy(segmented_image).astype(float)
+    segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
     labeled_seg = skimage.measure.label(segmented_image + 1, connectivity=2)
     values = np.unique(labeled_seg)
     # Find value of the large continuous 0-valued region.
