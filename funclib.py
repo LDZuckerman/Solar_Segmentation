@@ -67,7 +67,7 @@ def post_process(preds):
         # Where labeled_preds=IG_value set preds2 to zero, otherwise 1
         preds2[labeled_preds == IG_value] = 0
         preds2[labeled_preds != IG_value] = 1  
-    else: print('NOT YET IMPLEMENTED: NEED TO FIND A WAY TO GET 3-VALUE SEG INTO FORM CMPARABLE TO LABELS'); a=b
+    else: print('NOT YET IMPLEMENTED: NEED TO FIND A WAY TO GET 3-VALUE SEG INTO FORM COMPARABLE TO LABELS'); a=b
     # uniques = np.unique(preds)
     # preds2 = np.copy(preds)
     # if  len(uniques) == 2:
