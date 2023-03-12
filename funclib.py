@@ -36,6 +36,11 @@ def add_gradient_feats(df, data):
     df_new['gradientx'] = np.gradient(data)[1].reshape(-1)
     return df_new
 
+def add_sharpening_feats(df, dataflat):
+    df_new = df.copy()
+    df_new['value2'] = dataflat**2
+    return df_new
+
 def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
     # Flatten features and labels
     dataflat = data.reshape(-1)
@@ -84,6 +89,38 @@ def post_process(preds):
     #     print('NOT YET IMPLEMENTED: NEED TO FIND A WAY TO GET 3-VALUE SEG INTO FORM CMPARABLE TO LABELS')
     #     a=b
     return preds2
+
+def eval_metrics(metric, true, pred):
+    """
+    Ways of evaluating extent to which true and preds are the same, BUT ONLY IN THE CASE THAT THEY SHOULD BE.
+    E.g. for comparing labels to outputs of surpervised method, or to outputs of 2-value unsupervised method
+    where those two values have been converted to 0 = IG, 1 = G.
+    None of these will be usefull for >2-value unsupervised methods untill I figure out how to algorithmically
+    force the outputs (including combining groups) into IG, G, BP, DM values. 
+    """
+    if metric == 'pct_correct':
+        # Could be ok for our use; in gernal bad if huge class imbalance (could get high score by predicting all one class)
+        return len(np.where(preds==true)[0])/len(preds)
+    if metric == 'accuracy_score':
+        # Avg of the area of overlap over area of union for each class (like Jaccard score but for two or more classes)
+        return metrics.accuracy_score(true, pred)
+
+######## Functions for use with UNet tutorial 2
+
+import torch
+import torchvision
+
+
+def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda"):
+    model.eval() # set model into eval mode
+    for idx, (x, y) in enumerate(loader):
+        x = x.to(device=device)
+        with torch.no_grad():
+            preds = torch.sigmoid(model(x))
+            preds = (preds > 0.5).float()
+        torchvision.utils.save_image(preds, f"saved_images/pred_{idx}.png")
+        torchvision.utils.save_image(y.unsqueeze(1), f"{folder}{idx}.png")
+    model.train() # set model back into train mode
 
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
