@@ -5,6 +5,42 @@ import scipy.ndimage as sndi
 import skimage
 import pandas as pd
 from sklearn import preprocessing
+import astropy.io.fits as fits 
+import os
+
+######## histogram matching
+
+def match_to_firstlight(obs_data, n_bins=2000):
+
+    # Read in "good" image and normalize
+    synth_data = fits.open('../Data/DKIST_example.fits')[0].data
+    synth_data = (synth_data-np.nanmean(synth_data))/np.nanstd(synth_data)
+    # Compute good image histogram and cdf
+    synth_bins = np.linspace(np.nanmin(synth_data), np.nanmax(synth_data), n_bins)
+    width_synth_bins = synth_bins[1]-synth_bins[0]
+    synth_hist, _ = np.histogram(synth_data[np.isfinite(synth_data)].flatten(), bins=synth_bins, density=True)
+    synth_hist = np.expand_dims(synth_hist, axis=0) # since not loading data as stacked array
+    synth_cdf = np.cumsum(np.nanmean(synth_hist*width_synth_bins, axis=0))
+    # Normalize "bad" image
+    obs_data = (obs_data-np.nanmean(obs_data))/np.nanstd(obs_data)
+    # Compute good image histogram and cdf
+    obs_bins = np.linspace(np.nanmin(obs_data), np.nanmax(obs_data), n_bins)
+    width_obs_bins = obs_bins[1]-obs_bins[0]
+    obs_hist, _ = np.histogram(obs_data[np.isfinite(obs_data)].flatten(), bins=obs_bins, density=True)
+    obs_hist = np.expand_dims(obs_hist, axis=0) # since not loading data as stacked array
+    obs_cdf = np.cumsum(np.nanmean(obs_hist*width_obs_bins, axis=0))
+    # Perform matching
+    obs_data_matched = hist_matching(obs_data, obs_cdf, obs_bins, synth_cdf, synth_bins)
+    obs_data_matched = obs_data_matched.reshape(np.shape(obs_data))
+    return obs_data_matched
+
+    
+def hist_matching(data_in, cdf_in, bins_in, cdf_out, bins_out):
+    bins_in = 0.5*(bins_in[:-1] + bins_in[1:]) # Points for interpolation (input bins contain the edges)
+    bins_out = 0.5*(bins_out[:-1] + bins_out[1:])
+    cdf_tmp = np.interp(data_in.flatten(), bins_in.flatten(), cdf_in.flatten())  # Interpolation
+    data_out = np.interp(cdf_tmp, cdf_out.flatten(), bins_out.flatten())
+    return data_out
 
 ######## Functions for the machine learning segmentation of various solar features
 
@@ -131,8 +167,8 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 
 def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True):
     """
-    SIMILAR BUT NOT IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE, BUT 
-    WITH SMALL MODIFICATIONS, E.G. RETURNS ARRAY NOT MAP, AND RE-ADDED MARK_FAC FLAG
+    SIMILAR BUT NOT IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE.
+    SMALL MODIFICATIONS INCLUDE RETURNING ARRAY NOT MAP AND RE-ADDEDITION OF MARK_FAC FLAG
 
     Segment an optical image of the solar photosphere into tri-value maps with:
 
@@ -251,7 +287,7 @@ def get_threshold(data, method):
     #     print(f'\tWARNING: data too big so computing threshold based on 500x500 center')
     if len(data.flatten()) > 2000**2:  # if too big thresholding will take forever, and I feel like a subset should get the same value
         data = np.random.choice(data.flatten(), (500, 500))
-        print(f'\tWARNING: data too big so computing threshold based random samples reshaped to 500x500 image')
+        print(f'\tWARNING: data too big so computing threshold based on random samples reshaped to 500x500 image')
 
     if not isinstance(data, np.ndarray):
         raise ValueError("Input data must be an instance of a np.ndarray")
