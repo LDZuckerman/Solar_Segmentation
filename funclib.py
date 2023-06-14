@@ -5,8 +5,46 @@ import scipy.ndimage as sndi
 import skimage
 import pandas as pd
 from sklearn import preprocessing
+from sklearn import metrics
 import astropy.io.fits as fits 
 import os
+import torch.nn as nn
+
+######## Functions for NNs
+
+class multiclass_MSE_loss(nn.Module):
+
+    def __init__(self):
+        super(multiclass_MSE_loss, self).__init__()
+
+    def forward(self, preds, targets, dm_weight=1, bp_weight=1):
+        """
+        Compute MSE between preds and targets for each layer (Ig, DM, ..etc). 
+        Sum to get total, applying wieghting to small classes.
+        NOTE: in this blog, they do a similar thing for image classification https://towardsdatascience.com/implementing-custom-loss-functions-in-pytorch-50739f9e0ee1
+
+        Parameters
+        ----------
+        preds : `numpy.ndarray` of shape [n_obs, n_classes, n_pix, n_pix]
+            Model outputs before application of activation function
+        
+        Returns
+        -------
+        targets : `numpy.ndarray` [n_obs, n_classes, n_pix, n_pix]
+            One-hot encoded target values. Ordering along n_class axis must be the same as for preds.
+        """
+
+        preds = torch.sigmoid(preds) # use sigmiod to turn into class probs
+        mse_ig, mse_dm, mse_gr, mse_bp = 0, 0, 0, 0
+        mse = nn.MSELoss()
+        for idx in range(preds.shape[0]): # loop through images in batch
+            mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
+            mse_dm += mse(targets[idx,1,:,:], preds[idx,1,:,:]) * dm_weight
+            mse_gr += mse(targets[idx,2,:,:], preds[idx,2,:,:])
+            mse_bp += mse(targets[idx,3,:,:], preds[idx,3,:,:]) * bp_weight
+        loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
+        return loss
+
 
 ######## histogram matching
 
