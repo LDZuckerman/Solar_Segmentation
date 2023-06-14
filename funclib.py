@@ -45,6 +45,15 @@ class multiclass_MSE_loss(nn.Module):
         loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
         return loss
 
+def check_inputs(train_ds, train_loader):
+    # Check data is loaded correctly
+    print('Train data:')
+    print(f'     {len(train_ds)} obs, broken into {len(train_loader)} batches')
+    train_features, train_labels = next(iter(train_loader))
+    shape = train_features.size()
+    print(f'     Each batch has data of shape {train_features.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (features)')
+    shape = train_labels.size()
+    print(f'     Each batch has labels of shape {train_labels.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (classes)')
 
 ######## histogram matching
 
