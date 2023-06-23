@@ -9,6 +9,7 @@ from sklearn import metrics
 import astropy.io.fits as fits 
 import os
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 ######## Functions for NNs
 
@@ -46,6 +47,7 @@ class multiclass_MSE_loss(nn.Module):
         return loss
 
 def check_inputs(train_ds, train_loader):
+
     # Check data is loaded correctly
     print('Train data:')
     print(f'     {len(train_ds)} obs, broken into {len(train_loader)} batches')
@@ -55,7 +57,39 @@ def check_inputs(train_ds, train_loader):
     shape = train_labels.size()
     print(f'     Each batch has labels of shape {train_labels.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (classes)')
 
-######## histogram matching
+def get_feature(img, name, index):
+
+    if name == 'gradx': a = np.gradient(img)[0]
+    elif name == 'grady': a = np.gradient(img)[1]
+    elif name == 'squared': a = img**2
+    elif 'power' in name:
+        n = int(name[-1])
+        a = img**n
+    # elif name == 'deltaBinImg':
+    #     UNet1seg = np.load(f'../UNet1_outputs/pred_{index}.npy') # zeros and ones
+    #     imgnorm = (img - np.mean(img))/np.std(img) # normalize to range [0, 1]
+    #     a = UNet1seg - imgnorm # difference between binary segmentation and image (pos for bp, neg for dm)
+    else: raise ValueError(f'Channel name {name} not recognized')
+
+    return a
+
+######## Preprocessing 
+
+def histogram_equalization(data, n_bins=256):
+
+   #get image histogram
+   hist, bins = np.histogram(data.flatten(), n_bins, normed=True)
+   cdf = hist.cumsum()
+   cdf = 255 * cdf / cdf[-1] #normalize
+   # use linear interpolation of cdf to find new pixel values
+   data_out = np.interp(data.flatten(), bins[:-1], cdf)
+   data_out = data_out.reshape(data.shape)
+
+   return data_out
+
+def get_localRMS(data):
+    # Should I do this?
+    return None
 
 def match_to_firstlight(obs_data, n_bins=2000):
 
@@ -83,6 +117,7 @@ def match_to_firstlight(obs_data, n_bins=2000):
 
     
 def hist_matching(data_in, cdf_in, bins_in, cdf_out, bins_out):
+
     bins_in = 0.5*(bins_in[:-1] + bins_in[1:]) # Points for interpolation (input bins contain the edges)
     bins_out = 0.5*(bins_out[:-1] + bins_out[1:])
     cdf_tmp = np.interp(data_in.flatten(), bins_in.flatten(), cdf_in.flatten())  # Interpolation
@@ -92,6 +127,7 @@ def hist_matching(data_in, cdf_in, bins_in, cdf_out, bins_out):
 ######## Functions for the machine learning segmentation of various solar features
 
 def add_kernel_feats(df, dataflat):
+
     df_new = df.copy()
     k1 = np.array([[1, 1, 1],  # blur (maybe useful?)
                 [1, 1, 1],
@@ -111,6 +147,7 @@ def add_kernel_feats(df, dataflat):
     return df_new
 
 def add_gradient_feats(df, data):
+
     # Attempted to use cv2.Laplacian, but require dtype uint8, and converting caused issues with the normalization #cv2.Laplacian(data,cv2.CV_64F).reshape(-1)
     df_new = df.copy()
     df_new['gradienty'] = np.gradient(data)[0].reshape(-1)
@@ -118,11 +155,13 @@ def add_gradient_feats(df, data):
     return df_new
 
 def add_sharpening_feats(df, dataflat):
+
     df_new = df.copy()
     df_new['value2'] = dataflat**2
     return df_new
 
 def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
+
     # Flatten features and labels
     dataflat = data.reshape(-1)
     labelsflat = labels.reshape(-1)
@@ -139,6 +178,7 @@ def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
     return X, Y
 
 def post_process(preds, data):
+
     preds = np.copy(preds).astype(float)  # Float conversion for correct region numbering.
     preds2 = np.ones_like(preds)*20 # Just to aviod issues later on 
     # If its a 2-value seg
@@ -212,16 +252,19 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
-def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True):
+def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, fac_brightness_limit=None, fac_pix_limit=None):
     """
     SIMILAR BUT NOT IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE.
     SMALL MODIFICATIONS INCLUDE RETURNING ARRAY NOT MAP AND RE-ADDEDITION OF MARK_FAC FLAG
+    ALSO ADDED FAC_BRIGHTNESS_LIMIT  AND FAC_PIX_LIMIT SO THAT I CAN ADJUST THIS FOR JUN16 DATA
+    ALSO ADDED IG PADDING STEP UP FRONT BECASUE WITH LOCAL HE, EDGES WERE ALL GR 
 
-    Segment an optical image of the solar photosphere into tri-value maps with:
+    Segment an optical image of the solar photosphere into four-value maps with:
 
      * 0 as intergranule
-     * 0.5 as faculae (BP)
+     * 0.5 as "dim-middle"
      * 1 as granule
+     * 1.5 "brightpoint"
 
     Parameters
     ----------
@@ -254,7 +297,7 @@ def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=Fals
     # Fix the extra intergranule material bits in the middle of granules.
     seg_im_fixed = trim_intergranules(segmented_image, mark=mark_dim_centers)
     # Mark faculae and get final granule and facule count.
-    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution)
+    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution, fac_brightness_limit, fac_pix_limit)
     else: seg_im_markfac = seg_im_fixed
     # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
     segmented_map = seg_im_markfac
@@ -361,6 +404,7 @@ def trim_intergranules(segmented_image, mark=False):
     """
     Remove the erroneous identification of intergranule material in the middle
     of granules that the pure threshold segmentation produces.
+    ADDING IG PADDING STEP UP FRONT BECASUE WITH LOCAL HE, EDGES WERE ALL GR 
 
     Parameters
     ----------
@@ -375,18 +419,25 @@ def trim_intergranules(segmented_image, mark=False):
     segmented_image_fixed : `numpy.ndarray`
         The segmented image without incorrect extra intergranules.
     """
+
     if len(np.unique(segmented_image)) > 2:
         raise ValueError("segmented_image must only have values of 1 and 0.")
+    # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG (should not affect final output)
+    segmented_image[:,0:20] = 0 
+    segmented_image[0:20,:] = 0 
+    segmented_image[:,-20:] = 0 
+    segmented_image[-20:,:] = 0 
     segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
-    labeled_seg = skimage.measure.label(segmented_image + 1, connectivity=2)
+    labeled_seg = skimage.measure.label(segmented_image_fixed + 1, connectivity=2)
     values = np.unique(labeled_seg)
     # Find value of the large continuous 0-valued region.
     size = 0
     print(f'\tloop 1 to {len(values)} (should take like 2 minutes)')
     for value in values:
-        if len((labeled_seg[labeled_seg == value])) > size:
-            real_IG_value = value
-            size = len(labeled_seg[labeled_seg == value])
+        if len((labeled_seg[labeled_seg == value])) > size: # if bigger than previous largest
+            if sum(segmented_image[labeled_seg == value] == 0): # if a zero (IG) region
+                real_IG_value = value
+                size = len(labeled_seg[labeled_seg == value])
     # Set all other 0 regions to mark value (1 or 0.5).
     print(f'\tloop 2 to {len(values)} (should take like 2 minutes)')
     for value in values:
@@ -399,9 +450,10 @@ def trim_intergranules(segmented_image, mark=False):
     return segmented_image_fixed
 
 
-def mark_faculae(segmented_image, data, resolution):
+def mark_faculae(segmented_image, data, resolution, fac_brightness_limit=None, fac_pix_limit=None):
     """
     Mark faculae separately from granules - give them a value of 1.5 not 1.
+    ADDED FAC_BRIGHTNESS_LIMIT AND FAC_PIX_LIMIT SO THAT i CAN ADJUST THIS FOR JUN16 DATA
 
     Parameters
     ----------
@@ -421,10 +473,11 @@ def mark_faculae(segmented_image, data, resolution):
     granule_count: `int`
         The number of granules identified, after re-classifcation of faculae.
     """
-    fac_size_limit = 2  # Max size of a faculae in square arcsec.
-    fac_pix_limit = fac_size_limit / resolution
-    # General flux limit determined by visual inspection.
-    fac_brightness_limit = np.mean(data) + 0.5 * np.std(data)
+    if fac_pix_limit == None:
+        fac_size_limit = 2  # Max size of a faculae in square arcsec.
+        fac_pix_limit = fac_size_limit / resolution # SHOULD SQUARE THIS????
+    if fac_brightness_limit == None: 
+        fac_brightness_limit = np.nanmean(data) + 0.5 * np.nanstd(data) # General flux limit determined by visual inspection.
     if len(np.unique(segmented_image)) > 3:
         raise ValueError("segmented_image must have only values of 1, 0 and a 0.5 (if dim centers marked)")
     segmented_image_fixed = np.copy(segmented_image.astype(float))
@@ -448,3 +501,26 @@ def mark_faculae(segmented_image, data, resolution):
                     fac_count += 1
     gran_count = len(values) - 1 - fac_count  # Subtract 1 for IG region.
     return segmented_image_fixed, fac_count, gran_count
+
+
+
+    # #### PLACE THIS CODE WITHIN TRIM_INTERGRGRANULES FUNCTION ###
+    # print(real_IG_value)
+    # fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, figsize=(50, 10))
+    # im = ax1.imshow(segmented_image[0:2000, 0:2000], origin='lower')
+    # plt.colorbar(im, ax=ax1)
+    # im = ax2.imshow(labeled_seg[0:2000, 0:2000], origin='lower')
+    # plt.colorbar(im, ax=ax2); ax2.set_title('label values')
+    # region1, region2, region3 = np.zeros_like(labeled_seg)*np.NaN, np.zeros_like(labeled_seg)*np.NaN, np.zeros_like(labeled_seg)*np.NaN
+    # region1[labeled_seg==values[0]] = values[0]; print(np.where(labeled_seg==values[0]))
+    # region2[labeled_seg==values[1]] = values[1]
+    # region3[labeled_seg==values[2]] = values[2]; region3[labeled_seg==values[1]] = values[1] 
+    # im = ax3.imshow(region1[0:2000, 0:2000], origin='lower')
+    # plt.colorbar(im, ax=ax3); ax3.set_title('value 1')
+    # im = ax4.imshow(region2[0:2000, 0:2000], origin='lower')
+    # plt.colorbar(im, ax=ax4); ax4.set_title('value 2')
+    # im = ax5.imshow(region3[0:2000, 0:2000], origin='lower')
+    # plt.colorbar(im, ax=ax5); ax5.set_title('value 3 and 2')
+    # plt.savefig('test0622')
+    # a=b
+    ###################
