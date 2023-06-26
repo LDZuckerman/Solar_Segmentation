@@ -10,6 +10,7 @@ import astropy.io.fits as fits
 import os
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import skimage as sk
 
 ######## Functions for NNs
 
@@ -237,7 +238,6 @@ def eval_metrics(metric, true, pred):
 import torch
 import torchvision
 
-
 def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda"):
     model.eval() # set model into eval mode
     for idx, (x, y) in enumerate(loader):
@@ -252,12 +252,244 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
+def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, bp_min_flux=None, bp_max_size=0.15):
+    
+    """
+    Segment an optical image of the solar photosphere into four-value maps with:
+
+     * 0 as intergranule
+     * 0.5 as "dim-middle" (optional)
+     * 1 as granule
+     * 1.5 "brightpoint" (optional)
+
+    Parameters
+    ----------
+    smap : `numpy.ndarray`
+        NumPy array containing data to segment.
+    resolution : `float`
+        Spatial resolution (arcsec/pixel) of the data.
+    skimage_method : {"li", "otsu", "isodata", "mean", "minimum", "yen", "triangle"}
+        scikit-image thresholding method, defaults to "li".
+        Depending on input data, one or more of these methods may be
+        significantly better or worse than the others. Typically, 'li', 'otsu',
+        'mean', and 'isodata' are good choices, 'yen' and 'triangle' over-
+        identify intergranule material, and 'minimum' over identifies granules.
+    mark_dim_centers : `bool`
+        Whether to mark dim granule centers as a separate category for future exploration.
+    mark_bright_points : `bool`
+        Whether to mark bright points as a seperate catagory for future exploration
+    bp_min_flux : `float`
+        Minimum flux level per pixel for a region to be considered a Bright Point.
+        Defaalt is half a standard deviation above the mean flux.
+    bp_max_size: `float`
+        Maximum diameter (arcsec) to consider a region a Bright Point.
+        Defualt of 0.15. 
+
+    Returns
+    -------
+    segmented_map : `numpy.ndarray`
+        NumPy array containing a segmented image (with the original header).
+    """
+
+    # if skimage_method not in METHODS:
+    #     raise TypeError("Method must be one of: " + ", ".join(METHODS))
+
+    # Perform local histogram equalization on map.
+    map_norm = ((map - np.nanmin(map))/(np.nanmax(map) - np.nanmin(map))) * 225 # min-max normalization to [0, 225] 
+    map_HE = sk.filters.rank.equalize(map_norm.astype(int), footprint=sk.morphology.disk(250)) # MAKE FOOTPRINT SIZE DEPEND ON RESOLUTION!!!
+    # Apply initial skimage threshold.
+    median_filtered = sndi.median_filter(map_HE, size=3)
+    threshold = get_threshold_v2(median_filtered, skimage_method)
+    segmented_image = np.uint8(median_filtered > threshold)
+    # Fix the extra intergranule material bits in the middle of granules.
+    seg_im_fixed = trim_intergranules_v2(segmented_image, mark=mark_dim_centers)
+    # Mark faculae and get final granule and facule count.
+    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae_v2(seg_im_fixed, map, resolution, bp_min_flux, bp_max_size)
+    else: seg_im_markfac = seg_im_fixed
+    # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
+    segmented_map = seg_im_markfac
+    return segmented_map
+
+def get_threshold_v2(data, method):
+    """
+    Get the threshold value using given skimage segmentation type.
+
+    Parameters
+    ----------
+    data : `numpy.ndarray`
+        Data to threshold.
+    method : {"li", "otsu", "isodata", "mean", "minimum", "yen", "triangle"}
+        scikit-image thresholding method.
+
+    Returns
+    -------
+    threshold : `float`
+        Threshold value.
+    """
+    
+    if len(data.flatten()) > 2000**2:
+        data = np.random.choice(data.flatten(), (500, 500))
+        print(f'\tWARNING: data too big so computing threshold based on random samples reshaped to 500x500 image')
+
+    if not isinstance(data, np.ndarray):
+        raise ValueError("Input data must be an instance of a np.ndarray")
+    elif method == "li":
+        threshold = skimage.filters.threshold_li(data)
+    if method == "otsu":
+        threshold = skimage.filters.threshold_otsu(data)
+    elif method == "yen":
+        threshold = skimage.filters.threshold_yen(data)
+    elif method == "mean":
+        threshold = skimage.filters.threshold_mean(data)
+    elif method == "minimum":
+        threshold = skimage.filters.threshold_minimum(data)
+    elif method == "triangle":
+        threshold = skimage.filters.threshold_triangle(data)
+    elif method == "isodata":
+        threshold = skimage.filters.threshold_isodata(data)
+    # else:
+    #     raise ValueError("Method must be one of: " + ", ".join(METHODS))
+    return threshold
+
+def trim_intergranules_v2(segmented_image, mark=False):
+    """
+    Remove the erroneous identification of intergranule material in the middle
+    of granules that the pure threshold segmentation produces.
+
+    Parameters
+    ----------
+    segmented_image : `numpy.ndarray`
+        The segmented image containing incorrect extra intergranules.
+    mark : `bool`
+        If `False` (the default), remove erroneous intergranules.
+        If `True`, mark them as 0.5 instead (for later examination).
+
+    Returns
+    -------
+    segmented_image_fixed : `numpy.ndarray`
+        The segmented image without incorrect extra intergranules.
+    """
+
+    if len(np.unique(segmented_image)) > 2:
+        raise ValueError("segmented_image must only have values of 1 and 0.")
+    # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG (should not affect final output)
+    segmented_image[:,0:20] = 0 
+    segmented_image[0:20,:] = 0 
+    segmented_image[:,-20:] = 0 
+    segmented_image[-20:,:] = 0 
+    segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
+    labeled_seg = skimage.measure.label(segmented_image_fixed + 1, connectivity=2)
+    values = np.unique(labeled_seg)
+    # Find value of the large continuous 0-valued region.
+    size = 0
+    print(f'\tloop 1 to {len(values)} (should take like 2 minutes)')
+    for value in values:
+        if len((labeled_seg[labeled_seg == value])) > size: # if bigger than previous largest
+            if sum(segmented_image[labeled_seg == value] == 0): # if a zero (IG) region
+                real_IG_value = value
+                size = len(labeled_seg[labeled_seg == value])
+    # Set all other 0 regions to mark value (1 or 0.5).
+    print(f'\tloop 2 to {len(values)} (should take like 2 minutes)')
+    for value in values:
+        if np.sum(segmented_image[labeled_seg == value]) == 0:
+            if value != real_IG_value:
+                if not mark:
+                    segmented_image_fixed[labeled_seg == value] = 1
+                elif mark:
+                    segmented_image_fixed[labeled_seg == value] = 0.5
+    return segmented_image_fixed
+
+
+def mark_faculae_v2(segmented_image, data, resolution, bp_min_flux=None, bp_max_size=0.15):
+    """
+    Mark faculae separately from granules - give them a value of 1.5 not 1.
+
+    Parameters
+    ----------
+    segmented_image : `numpy.ndarray`
+        The segmented image containing incorrect middles.
+    data : `numpy array`
+        The original image (not normalized or equalized)
+    resolution : `float`
+        Spatial resolution (arcsec/pixel) of the data.
+    bp_min_flux : `float`
+        Minimum flux level per pixel for a region to be considered a Bright Point.
+        Defaalt is 0.25 standard deviations above the mean flux.
+    bp_max_size : `float`
+        Maximum diameter (arcsec) for a region to be considered a Bright Point.
+        Defualt of 0.15. 
+
+    Returns
+    -------
+    segmented_image_fixed : `numpy.ndrray`
+        The segmented image with faculae marked as 1.5.
+    faculae_count: `int`
+        The number of faculae identified in the image.
+    granule_count: `int`
+        The number of granules identified, after re-classifcation of faculae.
+    """
+    
+    fac_pix_limit = (bp_max_size / resolution)**2 # Max area in pixels
+    if bp_min_flux == None: 
+        bp_min_flux = np.nanmean(data) + 0.25 * np.nanstd(data) # General flux limit determined by visual inspection.
+    if len(np.unique(segmented_image)) > 3:
+        raise ValueError("segmented_image must have only values of 1, 0 and a 0.5 (if dim centers marked)")
+    segmented_image_fixed = np.copy(segmented_image.astype(float))
+    labeled_seg = skimage.measure.label(segmented_image + 1, connectivity=2)
+
+    # fig, ((ax1, ax2, ax3),(ax4, ax5, ax6))= plt.subplots(2, 3, figsize=(15, 10))
+    # im = ax1.imshow(segmented_image[2400:2550, 2150:2450], origin='lower')
+    # im = ax2.imshow(data[2400:2550, 2150:2450], origin='lower')
+    # im = ax3.imshow(labeled_seg[2400:2550, 2150:2450], origin='lower')
+    # ax3.set_title(np.unique(labeled_seg[2400:2550, 2150:2450]))
+    # im = ax4.imshow(segmented_image[2100:2300, 2100:2500], origin='lower')
+    # im = ax5.imshow(data[2100:2300, 2100:2500], origin='lower')
+    # im = ax6.imshow(labeled_seg[2100:2300, 2100:2500], origin='lower')
+    # ax6.set_title(np.unique(labeled_seg[2100:2300, 2100:2500]))
+    # plt.savefig('test0626')
+    # a=b
+    values = np.unique(labeled_seg)
+    fac_count = 0
+    print(f'\tloop 3 to {len(values)} (this is the sticking point)')
+    small_regions = np.zeros_like(segmented_image)
+    for value in values:
+        print(f'\t\t{value}', end='\r')
+        mask = np.zeros_like(segmented_image)
+        mask[labeled_seg == value] = 1
+        # Check that is a 1 (white) region.
+        if np.sum(np.multiply(mask, segmented_image)) > 0:
+            region_size = len(segmented_image_fixed[mask == 1])
+            # check that region is small.
+            if region_size < fac_pix_limit:
+                small_regions[mask == 1] = 1
+                # Check that peak flux very high.
+                tot_flux = np.nansum(data[mask == 1])
+                if np.max(data[mask == 1]) > bp_min_flux: # if tot_flux / region_size > bp_min_flux:
+                    segmented_image_fixed[mask == 1] = 1.5
+                    fac_count += 1
+                    small_regions[mask == 1] = 2
+    gran_count = len(values) - 1 - fac_count  # Subtract 1 for IG region.
+
+    # im = plt.imshow(small_regions, origin='lower'); plt.colorbar(im)
+    # plt.title('small regions (1 = bright enough)')
+    # plt.savefig('test0625b')
+    # # plt.hist(data.flatten(), bins=20, label='all pixels')
+    # # plt.hist(all_region_maxfluxes, label='all region maximums')
+    # # plt.hist(small_region_maxfluxes, label='small region maximums')
+    # # plt.legend()
+    # # plt.vlines([np.nanmean(data)+0.25*np.nanstd(data)], ymin=0, ymax=7e6, color='black', label='mean+0.25*SD')
+    # # plt.legend()
+    # # plt.yscale('log')
+    # # plt.title('VBI_04_05_4096')
+    # # plt.savefig('test0625')
+
+    return segmented_image_fixed, fac_count, gran_count
+
+
 def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, fac_brightness_limit=None, fac_pix_limit=None):
     """
-    SIMILAR BUT NOT IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE.
-    SMALL MODIFICATIONS INCLUDE RETURNING ARRAY NOT MAP AND RE-ADDEDITION OF MARK_FAC FLAG
-    ALSO ADDED FAC_BRIGHTNESS_LIMIT  AND FAC_PIX_LIMIT SO THAT I CAN ADJUST THIS FOR JUN16 DATA
-    ALSO ADDED IG PADDING STEP UP FRONT BECASUE WITH LOCAL HE, EDGES WERE ALL GR 
+    IDENTICAL TO FUNCTIONS IN DKISTSegmentation REPO AND Sunkit-Image PACKAGE.
+    EXCEPT RETURNING ARRAY NOT MAP AND RE-ADDEDITION OF MARK_FAC FLAG
 
     Segment an optical image of the solar photosphere into four-value maps with:
 
@@ -297,7 +529,7 @@ def segment_array(map, resolution, *, skimage_method="li", mark_dim_centers=Fals
     # Fix the extra intergranule material bits in the middle of granules.
     seg_im_fixed = trim_intergranules(segmented_image, mark=mark_dim_centers)
     # Mark faculae and get final granule and facule count.
-    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution, fac_brightness_limit, fac_pix_limit)
+    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae(seg_im_fixed, map, resolution)
     else: seg_im_markfac = seg_im_fixed
     # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
     segmented_map = seg_im_markfac
@@ -368,16 +600,6 @@ def get_threshold(data, method):
     threshold : `float`
         Threshold value.
     """
-    
-    # if len(data.flatten()) > 2000**2: # if too big thresholding will take forever, and I feel like a subset should get the same value
-    #     data = data[0:500, 0:500] 
-    #     print(f'\tWARNING: data too big so computing threshold based on 500x500 corner')
-    # if len(data.flatten()) > 2000**2:  # if too big thresholding will take forever, and I feel like a subset should get the same value
-    #     data = data[int(np.shape(data)[0]/2)-250:int(np.shape(data)[0]/2)+250, int(np.shape(data)[1]/2)-250:int(np.shape(data)[1]/2)+250]
-    #     print(f'\tWARNING: data too big so computing threshold based on 500x500 center')
-    if len(data.flatten()) > 2000**2:  # if too big thresholding will take forever, and I feel like a subset should get the same value
-        data = np.random.choice(data.flatten(), (500, 500))
-        print(f'\tWARNING: data too big so computing threshold based on random samples reshaped to 500x500 image')
 
     if not isinstance(data, np.ndarray):
         raise ValueError("Input data must be an instance of a np.ndarray")
@@ -404,7 +626,6 @@ def trim_intergranules(segmented_image, mark=False):
     """
     Remove the erroneous identification of intergranule material in the middle
     of granules that the pure threshold segmentation produces.
-    ADDING IG PADDING STEP UP FRONT BECASUE WITH LOCAL HE, EDGES WERE ALL GR 
 
     Parameters
     ----------
@@ -422,11 +643,6 @@ def trim_intergranules(segmented_image, mark=False):
 
     if len(np.unique(segmented_image)) > 2:
         raise ValueError("segmented_image must only have values of 1 and 0.")
-    # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG (should not affect final output)
-    segmented_image[:,0:20] = 0 
-    segmented_image[0:20,:] = 0 
-    segmented_image[:,-20:] = 0 
-    segmented_image[-20:,:] = 0 
     segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
     labeled_seg = skimage.measure.label(segmented_image_fixed + 1, connectivity=2)
     values = np.unique(labeled_seg)
@@ -450,10 +666,9 @@ def trim_intergranules(segmented_image, mark=False):
     return segmented_image_fixed
 
 
-def mark_faculae(segmented_image, data, resolution, fac_brightness_limit=None, fac_pix_limit=None):
+def mark_faculae(segmented_image, data, resolution):
     """
     Mark faculae separately from granules - give them a value of 1.5 not 1.
-    ADDED FAC_BRIGHTNESS_LIMIT AND FAC_PIX_LIMIT SO THAT i CAN ADJUST THIS FOR JUN16 DATA
 
     Parameters
     ----------
@@ -473,11 +688,9 @@ def mark_faculae(segmented_image, data, resolution, fac_brightness_limit=None, f
     granule_count: `int`
         The number of granules identified, after re-classifcation of faculae.
     """
-    if fac_pix_limit == None:
-        fac_size_limit = 2  # Max size of a faculae in square arcsec.
-        fac_pix_limit = fac_size_limit / resolution # SHOULD SQUARE THIS????
-    if fac_brightness_limit == None: 
-        fac_brightness_limit = np.nanmean(data) + 0.5 * np.nanstd(data) # General flux limit determined by visual inspection.
+    fac_size_limit = 2  # Max size of a faculae in square arcsec.
+    fac_pix_limit = fac_size_limit / resolution # SHOULD SQUARE THIS???? 
+    fac_brightness_limit = np.nanmean(data) + 0.5 * np.nanstd(data) # General flux limit determined by visual inspection.
     if len(np.unique(segmented_image)) > 3:
         raise ValueError("segmented_image must have only values of 1, 0 and a 0.5 (if dim centers marked)")
     segmented_image_fixed = np.copy(segmented_image.astype(float))
