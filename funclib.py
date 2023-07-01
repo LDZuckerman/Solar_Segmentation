@@ -280,7 +280,7 @@ def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=F
         Whether to mark bright points as a seperate catagory for future exploration
     bp_min_flux : `float`
         Minimum flux level per pixel for a region to be considered a Bright Point.
-        Defaalt is half a standard deviation above the mean flux.
+        Defaalt is one standard deviation above the mean flux.
     bp_max_size: `float`
         Maximum diameter (arcsec) to consider a region a Bright Point.
         Defualt of 0.15. 
@@ -294,17 +294,17 @@ def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=F
     # if skimage_method not in METHODS:
     #     raise TypeError("Method must be one of: " + ", ".join(METHODS))
 
-    # Perform local histogram equalization on map.
+    # Obtain local histogram equalization of map.
     map_norm = ((map - np.nanmin(map))/(np.nanmax(map) - np.nanmin(map))) * 225 # min-max normalization to [0, 225] 
     map_HE = sk.filters.rank.equalize(map_norm.astype(int), footprint=sk.morphology.disk(250)) # MAKE FOOTPRINT SIZE DEPEND ON RESOLUTION!!!
-    # Apply initial skimage threshold.
+    # Apply initial skimage threshold for initial rough segmentation into granules and intergranules.
     median_filtered = sndi.median_filter(map_HE, size=3)
     threshold = get_threshold_v2(median_filtered, skimage_method)
     segmented_image = np.uint8(median_filtered > threshold)
     # Fix the extra intergranule material bits in the middle of granules.
     seg_im_fixed = trim_intergranules_v2(segmented_image, mark=mark_dim_centers)
     # Mark faculae and get final granule and facule count.
-    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae_v2(seg_im_fixed, map, resolution, bp_min_flux, bp_max_size)
+    if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae_v2b(seg_im_fixed, map, map_HE, resolution, bp_min_flux, bp_max_size)
     else: seg_im_markfac = seg_im_fixed
     # logging.info(f"Segmentation has identified {granule_count} granules and {faculae_count} faculae")
     segmented_map = seg_im_markfac
@@ -399,6 +399,83 @@ def trim_intergranules_v2(segmented_image, mark=False):
                     segmented_image_fixed[labeled_seg == value] = 0.5
     return segmented_image_fixed
 
+def mark_faculae_v2b(segmented_image, data, HE_data, resolution, bp_min_flux=None, bp_max_size=0.15):
+    """
+    Mark faculae separately from granules - give them a value of 1.5 not 1.
+
+    Parameters
+    ----------
+    segmented_image : `numpy.ndarray`
+        The segmented image containing incorrect middles.
+    data : `numpy array`
+        The original image (not normalized or equalized)
+    resolution : `float`
+        Spatial resolution (arcsec/pixel) of the data.
+    bp_min_flux : `float`
+        Minimum flux level per pixel for a region to be considered a Bright Point.
+        Default is 1 standard deviation above the mean flux (using equalized data)
+    bp_max_size : `float`
+        Maximum diameter (arcsec) for a region to be considered a Bright Point.
+        Defualt of 0.15. 
+
+    Returns
+    -------
+    segmented_image_fixed : `numpy.ndrray`
+        The segmented image with faculae marked as 1.5.
+    faculae_count: `int`
+        The number of faculae identified in the image.
+    granule_count: `int`
+        The number of granules identified, after re-classifcation of faculae.
+    """
+
+    # Check inputs and initialize output map
+    if len(np.unique(segmented_image)) > 3:
+        raise ValueError("segmented_image must have only values of 1, 0 and a 0.5 (if dim centers marked)")
+    segmented_image_fixed = np.copy(segmented_image.astype(float))
+    # Set BP pixel limit
+    fac_pix_limit = (bp_max_size / resolution)**2 # Max area in pixels
+    # Use equalized map to set BP flux threshold and extract thresholded map
+    if bp_min_flux == None: 
+        bp_min_flux = np.nanmean(HE_data) + 1.25*np.nanstd(HE_data) # General flux limit determined by visual inspection.
+    bright_dim_seg = np.zeros_like(data)
+    bright_dim_seg[HE_data > bp_min_flux] = 1
+    # Label the bright regions and get list of values
+    labeled_bright_dim_seg = skimage.measure.label(bright_dim_seg + 1, connectivity=2)
+    values = np.unique(labeled_bright_dim_seg)
+
+    plt.figure()
+    plt.imshow(bright_dim_seg, origin='lower')
+    plt.title('bright_dim_seg')
+    plt.savefig('test_brightdimseg')
+
+    # Obtain gradient map and set threshold for gradient on BP edges
+    grad = np.abs(np.gradient(data)[0] + np.gradient(data)[1])
+    bp_min_grad = np.quantile(grad, 0.95)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    im = ax1.imshow(data)
+    highgrad = np.empty_like(grad)
+    highgrad[grad>bp_min_grad] = 1
+    im = ax2.imshow(highgrad)
+    plt.savefig('test_gradient')
+
+    # Loop through bright regions, select those under pixel limit and containing high gradient
+    fac_count = 0
+    print(f'\tloop 3 to {len(values)} (this is the sticking point)')
+    for value in values:
+         print(f'\t\t{value}', end='\r')
+         if (bright_dim_seg[labeled_bright_dim_seg==value])[0]==1: # Check region is not the non-bp region
+            # check that region is small.
+            region_size = len(labeled_bright_dim_seg[labeled_bright_dim_seg==value])
+            if region_size < fac_pix_limit:
+                # check that region has high average gradient (maybe try max gradient?)
+                region_mean_grad = np.mean(grad[labeled_bright_dim_seg==value])
+                if region_mean_grad > bp_min_grad:
+                    segmented_image_fixed[labeled_bright_dim_seg==value] = 1.5
+                    fac_count += 1
+    gran_count = len(values) - 1 - fac_count  # Subtract 1 for IG region.
+
+    return segmented_image_fixed, fac_count, gran_count
 
 def mark_faculae_v2(segmented_image, data, resolution, bp_min_flux=None, bp_max_size=0.15):
     """
