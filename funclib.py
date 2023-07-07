@@ -10,7 +10,7 @@ import astropy.io.fits as fits
 import os
 import torch.nn as nn
 import matplotlib.pyplot as plt
-import skimage as sk
+import skimage as s
 
 ######## Functions for NNs
 
@@ -73,6 +73,54 @@ def get_feature(img, name, index):
     else: raise ValueError(f'Channel name {name} not recognized')
 
     return a
+
+def compute_validation_results(output_dir, binary=False):
+    '''
+    Compute the total percent correct, and percent correct on each class, using outputs of 
+    NN on validation data
+    '''
+
+    truefiles = [file for file in os.listdir(output_dir) if 'true' in file]
+    predfiles = [file for file in os.listdir(output_dir) if 'pred' in file]
+
+    pix_correct, ig_correct, dm_correct, gr_correct, bp_correct = 0, 0, 0, 0, 0
+    tot_pix, tot_ig, tot_dm, tot_gr, tot_bp = 0, 0, 0, 0, 0
+    if binary:
+        for i in range(len(truefiles)):
+            true = np.load(f'{output_dir}/{truefiles[i]}')
+            preds = np.load(f'{output_dir}/{predfiles[i]}')
+            pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+            tot_pix += len(preds.flatten()) # torch.numel(preds)
+            ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+            tot_ig += len(np.where(true.flatten() == 0)[0])
+            gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+            tot_gr += len(np.where(true.flatten() == 1)[0])
+        pct_correct = pix_correct/tot_pix*100
+        pct_ig_correct = ig_correct/tot_ig*100
+        pct_dm_correct = np.NaN
+        pct_gr_correct = gr_correct/tot_gr*100
+        pct_bp_correct = np.NaN
+    else:
+        for i in range(len(truefiles)):
+            true = np.load(f'{output_dir}/{truefiles[i]}')
+            preds = np.load(f'{output_dir}/{predfiles[i]}')
+            pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+            tot_pix += len(preds.flatten()) # torch.numel(preds)
+            ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+            tot_ig += len(np.where(true.flatten() == 0)[0])
+            dm_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0.5))[0])
+            tot_dm += len(np.where(true.flatten() == 0.5)[0])
+            gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+            tot_gr += len(np.where(true.flatten() == 1)[0])
+            bp_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1.5))[0])
+            tot_bp += len(np.where(true.flatten() == 1.5)[0])
+        pct_correct = pix_correct/tot_pix*100
+        pct_ig_correct = ig_correct/tot_ig*100
+        pct_dm_correct = dm_correct/tot_dm*100
+        pct_gr_correct = gr_correct/tot_gr*100
+        pct_bp_correct = bp_correct/tot_bp*100
+
+    return pct_correct, pct_ig_correct, pct_dm_correct, pct_gr_correct, pct_bp_correct
 
 ######## Preprocessing 
 
@@ -792,7 +840,16 @@ def mark_faculae(segmented_image, data, resolution):
     gran_count = len(values) - 1 - fac_count  # Subtract 1 for IG region.
     return segmented_image_fixed, fac_count, gran_count
 
+def convert_to_binary(seg):
+    '''
+    Convert 4-value seg into binary (so that dont have to rerun seg algorithm)
+    Both DM *and* BPs are converted to GR
+    '''
+    binseg = np.copy(seg)
+    binseg[seg == 0.5] = 1
+    binseg[seg == 1.5] = 1
 
+    return binseg
 
     # #### PLACE THIS CODE WITHIN TRIM_INTERGRGRANULES FUNCTION ###
     # print(real_IG_value)

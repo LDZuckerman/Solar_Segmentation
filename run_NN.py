@@ -38,6 +38,7 @@ class MyDataset(Dataset):
         if self.norm:  # normalize 
             img = (img - np.mean(img))/np.std(img)
         if self.multichannel: # Add feature layers
+            if len(self.channels > 1): raise ValueError('multichannel set to True, but no channels provided')
             image = np.zeros((len(self.channels)+1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
             image[0, :, :] = img
             for i in range(len(self.channels)):
@@ -58,7 +59,7 @@ class MyDataset(Dataset):
             mask[2, :, :] = mask_gr
             mask[3, :, :] = mask_bp
         else: # Add dummy axis
-            mask = np.zeros((1, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            mask = np.zeros((2, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
             mask[0, :, :] = labels
         return image, mask
 
@@ -84,7 +85,6 @@ class DoubleConv(nn.Module):
 
         # print(f'\t\tCalling MyUNet.DoubleConv foward with x shape {x.shape}, with first Conv2d layer {self.conv[0]}')
         return self.conv(x)
-
 
 # UNet
 class MyUNet(nn.Module):
@@ -114,7 +114,6 @@ class MyUNet(nn.Module):
 
         #print('Finished calling _init_')
     
-
     def forward(self, x): # this is what gets called when you call MyUNet
 
         # Initialize list to store skip connections
@@ -150,6 +149,7 @@ def train(loader, model, optimizer, loss_fn, scaler, multiclass=False, dm_weight
         # set to use cpu
         data = data.to(device="cpu")
         targets = targets.float().to(device='cpu')
+
         # forward
         predictions = model(data) # call model to get predictions (not class probs; contains negs; apply sigmoid to get probs).
         if isinstance(loss_fn, funclib.multiclass_MSE_loss):
@@ -189,15 +189,22 @@ def validate(val_loader, model):
     return accuracy, dice_score
 
 # Function to save results of trained model on validation data
-def save_val_results(val_loader, save_dir):
+def save_val_results(val_loader, save_dir, model):
+    '''
+    Run each validation obs through model, save results
+    True and predicted vals are saved as 2d maps; e.g. compressed back to original seg format
+    '''
+
     print(f'Loading model back in, saving results on validation data in {save_dir}')
     if os.path.exists(save_dir) == False: os.mkdir(save_dir)
     i = 0
     for X, y in val_loader:
         X, y = X.to('cpu'), y.to('cpu')
         preds = torch.sigmoid(model(X))
-        if preds.shape[1] == 1: # if binary (predictions have 1 layer)
+        if preds.shape[1] == 2: # if binary (predictions have 2 layers) 
             preds = (preds > 0.5).float() # turn regression value (between zero and 1, e.g. "prob of being 1") into predicted 0s and 1s
+            preds = preds.detach().numpy()[:,0,:,:] # NOTE: currently I am still constructing binary inputs/truths as 2 layers where second is just dummy layer
+            y = y.detach().numpy()[:,0,:,:] # NOTE: currently I am still constructing binary inputs/truths as 2 layers where second is just dummy layer
         else: # if muliclasss (predictions have n_classes layers)
             preds = np.argmax(preds.detach().numpy(), axis=1) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
             y = np.argmax(y.detach().numpy(), axis=1) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
@@ -209,25 +216,33 @@ def save_val_results(val_loader, save_dir):
             np.save(f'{save_dir}/pred_{i}', np.array(preds[j]))
             i += 1
 
+UNet_name = 'UNet9'
+multiclass = True
+multichannel = False
+imdir = "../Data/UNetData_v2_subset/images/"
+segdir = "../Data/UNetData_v2_subset/seg_images/"
+in_channels = 1
+out_channels = 4
+loss_fn = funclib.multiclass_MSE_loss() 
+load_model = False
+num_epochs = 3 
+
 # Get the data, applying some transformations (Should pull segs and truths correctly based on their positions in the directories)
 batch_size = 16
-train_ds = MyDataset(image_dir="../Data/UNetData_v2/images/train", mask_dir="../Data/UNetData_v2/seg_images/train",multiclass=True) # multichannel=True, channels=['deltaBinImg'], 
+train_ds = MyDataset(image_dir=f"{imdir}train", mask_dir=f"{segdir}train", multiclass=multiclass, multichannel=multichannel) # multichannel=True, channels=['deltaBinImg'], 
 train_loader = DataLoader(train_ds, batch_size=batch_size, num_workers=2, pin_memory=True, shuffle=True)
-val_ds = MyDataset(image_dir="../Data/UNetData_v2/images/val", mask_dir="../Data/UNetData_v2/seg_images/val", multiclass=True) # multichannel=True, channels=['deltaBinImg'],
+val_ds = MyDataset(image_dir=f"{imdir}val", mask_dir=f"{segdir}val", multiclass=multiclass, multichannel=multichannel) # multichannel=True, channels=['deltaBinImg'],
 val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=2, pin_memory=True, shuffle=False)
 funclib.check_inputs(train_ds, train_loader)
 
 # Define model (as an instance of MyNeuralNet), loss function, and optimizer
-model = MyUNet(in_channels=1, out_channels=4).to("cpu")
-loss_fn = funclib.multiclass_MSE_loss() 
+model = MyUNet(in_channels, out_channels).to("cpu")
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
-load_model = False
 if load_model: 
     model.load_state_dict(torch.load("../NN_storage/UNET_checkpoint.pth.tar")["state_dict"])
 
 # Train
 print('Training:')
-num_epochs = 3
 scaler = torch.cuda.amp.GradScaler() # Don't have cuda
 for epoch in range(num_epochs):
     print(f'\tEpoch {epoch}')
@@ -243,10 +258,12 @@ for epoch in range(num_epochs):
     model.train() # set model back into train mode
 
 # Save model 
-torch.save(model.state_dict(), '../NN_storage/UNet7.pth')
-print('Saving trained model as UNet7.pth')
+torch.save(model.state_dict(), f'../NN_storage/{UNet_name}.pth')
+print(f'Saving trained model as {UNet_name}.pth')
 
 # Load it back in and save results on validation data 
-model = MyUNet(in_channels=2, out_channels=4)
-model.load_state_dict(torch.load('../NN_storage/UNet7.pth'))
-save_val_results(val_loader, save_dir='../UNet7_outputs')
+model = MyUNet(in_channels, out_channels)
+model.load_state_dict(torch.load(f'../NN_storage/{UNet_name}.pth'))
+save_val_results(val_loader, save_dir=f'../{UNet_name}_outputs', model=model)
+
+
