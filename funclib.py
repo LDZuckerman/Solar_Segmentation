@@ -2,7 +2,6 @@ import numpy as np
 import cv2
 import sunpy
 import scipy.ndimage as sndi
-import skimage
 import pandas as pd
 from sklearn import preprocessing
 from sklearn import metrics
@@ -10,24 +9,130 @@ import astropy.io.fits as fits
 import os
 import torch.nn as nn
 import matplotlib.pyplot as plt
-import skimage as s
+import skimage as sk
+import scipy.stats as stats
+import torch
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+import torch.nn.functional as F
+from torch.utils.data import Dataset, TensorDataset, DataLoader
 
 ######## Functions for NNs
+
+# Dataset
+class MyDataset(Dataset):
+
+    def __init__(self, image_dir, mask_dir, norm=False, channels=[], n_classes=2, randomSharp=False, im_size=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.images = os.listdir(image_dir)
+        self.norm = norm
+        self.channels = channels
+        self.n_classes = n_classes
+        self.randomSharp = randomSharp
+        self.im_size = im_size
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        # Get image
+        img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image
+        img = np.load(img_path).newbyteorder().byteswap() 
+        if self.randomSharp: # add 50% chance of image being blurred/sharpened by a factor pulled from a skewed guassian (equal chance of 1/4 and 4)
+            img =((img - np.nanmin(img))/(np.nanmax(img) - np.nanmin(img))) # first must [0, 1] normalize
+            img = torch.from_numpy(np.expand_dims(img, axis=0)) # transforms expect a batch dimension
+            n = stats.halfnorm.rvs(loc=1, scale=1, size=1)[0]
+            s = n if np.random.rand(1)[0] < 0.5 else 1/n
+            transf = transforms.RandomAdjustSharpness(sharpness_factor=s, p=0.5)
+            img = transf(img)[0] # remove batch dimension for now
+        if self.norm:  # normalize 
+            img = (img - np.mean(img))/np.std(img) # normalize to std normal dist
+        if self.channels != []: # Add feature layers
+            image = np.zeros((len(self.channels)+1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            image[0, :, :] = img
+            for i in range(len(self.channels)):
+                image[i+1, :, :] = get_feature(img, self.channels[i], index)
+        else: # Add dummy axis
+            image = np.zeros((1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            image[0, :, :] = img
+        if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
+            image = image[:, 0:self.im_size, 0:self.im_size]
+        # Get labels
+        mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image THIS SHOULD ENSURE ITS THE MASK CORRESPONDING TO THE CORRECT IMAGE
+        labels = np.load(mask_path).newbyteorder().byteswap() 
+        if self.n_classes==4: # One-hot encode targets so they are the correct size
+            mask = np.zeros((4, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            mask_gr, mask_ig, mask_bp, mask_dm = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
+            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+            mask_dm[labels == 0.5] = 1 # 1 where dim middle, 0 elsewhere
+            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+            mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
+            mask[0, :, :] = mask_ig
+            mask[1, :, :] = mask_dm
+            mask[2, :, :] = mask_gr
+            mask[3, :, :] = mask_bp
+        if self.n_classes==3: # One-hot encode targets so they are the correct size
+            mask = np.zeros((3, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            mask_gr, mask_ig, mask_bp = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
+            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+            mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
+            mask[0, :, :] = mask_ig
+            mask[1, :, :] = mask_gr
+            mask[2, :, :] = mask_bp
+        elif self.n_classes==2: # One-hot encode targets so they are the correct size
+            mask = np.zeros((2, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+            mask_gr, mask_ig = np.zeros_like(labels), np.zeros_like(labels)
+            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+            mask[0, :, :] = mask_ig
+            mask[1, :, :] = mask_gr
+        if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 4 times, for WNet
+            mask = mask[:, 0:self.im_size, 0:self.im_size]
+        return image, mask
+
+def probs_to_preds(probs):
+    '''
+    Helper function to turn 3D class probs into 2D arrays of predictions (also changes tensor to numpy)
+    '''
+    if probs.shape[1] == 1: # if binary (predictions have 1 layer)
+        preds = (probs > 0.5).float() # turn regression value (between zero and 1, e.g. "prob of being 1") into predicted 0s and 1s
+    else: # if muliclasss (predictions have n_classes layers)
+        preds = np.argmax(probs.detach().numpy(), axis=1) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+
+    return preds
+
+def onehot_to_map(y):
+    '''
+    Helper function to turn 3D truth stack into 2D array of truth labels (also changes tensor to numpy)
+    '''
+    if y.shape[1] == 2: # if binary (y has 2 layers) 
+        y = y.detach().numpy()[:,0,:,:] 
+    elif y.shape[1] == 3: # if 3 classs (y has 3 layers)
+        y = np.argmax(y.detach().numpy(), axis=1).astype(np.float) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+        y[y == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
+    elif y.shape[1] == 4: # if 4 classs (y has 3 layers)
+        y = np.argmax(y.detach().numpy(), axis=1) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+        y = y/2 # change from idx to class value 0 -> 0 (IG), 1 -> 0.5 (DM), 2 -> 1 (G), 3 -> 1.5 (BP)
+
+    return y
 
 class multiclass_MSE_loss(nn.Module):
 
     def __init__(self):
         super(multiclass_MSE_loss, self).__init__()
 
-    def forward(self, preds, targets, dm_weight=1, bp_weight=1):
+    def forward(self, outputs, targets, dm_weight=1, bp_weight=1):
         """
         Compute MSE between preds and targets for each layer (Ig, DM, ..etc). 
         Sum to get total, applying wieghting to small classes.
         NOTE: in this blog, they do a similar thing for image classification https://towardsdatascience.com/implementing-custom-loss-functions-in-pytorch-50739f9e0ee1
-
+        NOTE: should really just generalize this to any num classes
+        
         Parameters
         ----------
-        preds : `numpy.ndarray` of shape [n_obs, n_classes, n_pix, n_pix]
+        outputs : `numpy.ndarray` of shape [n_obs, n_classes, n_pix, n_pix]
             Model outputs before application of activation function
         
         Returns
@@ -36,18 +141,28 @@ class multiclass_MSE_loss(nn.Module):
             One-hot encoded target values. Ordering along n_class axis must be the same as for preds.
         """
 
-        preds = torch.sigmoid(preds) # use sigmiod to turn into class probs
-        mse_ig, mse_dm, mse_gr, mse_bp = 0, 0, 0, 0
+        probs = torch.sigmoid(outputs) # use sigmiod to turn into class probs
+        preds =  probs_to_preds(probs) # JUST ADDED - WILL IT FIX IT?
         mse = nn.MSELoss()
-        for idx in range(preds.shape[0]): # loop through images in batch
-            mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
-            mse_dm += mse(targets[idx,1,:,:], preds[idx,1,:,:]) * dm_weight
-            mse_gr += mse(targets[idx,2,:,:], preds[idx,2,:,:])
-            mse_bp += mse(targets[idx,3,:,:], preds[idx,3,:,:]) * bp_weight
-        loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
+        n_classes = len(targets[0,:,0,0])
+        if n_classes == 3:
+            mse_ig, mse_gr, mse_bp = 0, 0, 0
+            for idx in range(probs.shape[0]): # loop through images in batch
+                mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
+                mse_gr += mse(targets[idx,1,:,:], preds[idx,1,:,:])
+                mse_bp += mse(targets[idx,2,:,:], preds[idx,2,:,:]) * bp_weight
+            loss =  mse_ig + mse_gr + bp_weight*mse_bp
+        if n_classes == 4:
+            mse_ig, mse_dm, mse_gr, mse_bp = 0, 0, 0, 0
+            for idx in range(preds.shape[0]): # loop through images in batch
+                mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
+                mse_dm += mse(targets[idx,1,:,:], preds[idx,1,:,:]) * dm_weight
+                mse_gr += mse(targets[idx,2,:,:], preds[idx,2,:,:])
+                mse_bp += mse(targets[idx,3,:,:], preds[idx,3,:,:]) * bp_weight
+            loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
         return loss
 
-def check_inputs(train_ds, train_loader):
+def check_inputs(train_ds, train_loader, savefig=False, name=None):
 
     # Check data is loaded correctly
     print('Train data:')
@@ -57,6 +172,17 @@ def check_inputs(train_ds, train_loader):
     print(f'     Each batch has data of shape {train_features.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (features)')
     shape = train_labels.size()
     print(f'     Each batch has labels of shape {train_labels.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (classes)')
+    if savefig:
+        fig, ((ax1, ax2), (ax3, ax4), (ax5, ax6), (ax7, ax8)) = plt.subplots(4, 2, figsize=(2*4, 4*4)); axs = [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]
+        ax1.set_title('image')
+        ax2.set_title('labels')
+        for i in range(0, 8, 2):
+            X, y = next(iter(train_loader))
+            y = onehot_to_map(y)
+            im1 = axs[i].imshow(X[0,0,:,:]); plt.colorbar(im1, ax=axs[i]) # first img in batch, first channel
+            im2 = axs[i+1].imshow(y[0,:,:]); plt.colorbar(im2, ax=axs[i+1]) # first y in batch, already class-collapsed
+        plt.savefig(f'traindata_{name}')
+
 
 def get_feature(img, name, index):
 
@@ -74,7 +200,7 @@ def get_feature(img, name, index):
 
     return a
 
-def compute_validation_results(output_dir, binary=False):
+def compute_validation_results(output_dir, n_classes=2):
     '''
     Compute the total percent correct, and percent correct on each class, using outputs of 
     NN on validation data
@@ -85,27 +211,32 @@ def compute_validation_results(output_dir, binary=False):
 
     pix_correct, ig_correct, dm_correct, gr_correct, bp_correct = 0, 0, 0, 0, 0
     tot_pix, tot_ig, tot_dm, tot_gr, tot_bp = 0, 0, 0, 0, 0
-    if binary:
-        for i in range(len(truefiles)):
-            true = np.load(f'{output_dir}/{truefiles[i]}')
-            preds = np.load(f'{output_dir}/{predfiles[i]}')
-            pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
-            tot_pix += len(preds.flatten()) # torch.numel(preds)
+
+    for i in range(len(truefiles)):
+        true = np.load(f'{output_dir}/{truefiles[i]}')
+        preds = np.load(f'{output_dir}/{predfiles[i]}')
+
+        # if len(np.unique(true)) == 3:
+        #     plt.figure(); im = plt.imshow(true); plt.colorbar(im)
+        #     print()
+
+        pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+        tot_pix += len(preds.flatten()) # torch.numel(preds)
+        if n_classes == 2: 
             ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
             tot_ig += len(np.where(true.flatten() == 0)[0])
             gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
             tot_gr += len(np.where(true.flatten() == 1)[0])
-        pct_correct = pix_correct/tot_pix*100
-        pct_ig_correct = ig_correct/tot_ig*100
-        pct_dm_correct = np.NaN
-        pct_gr_correct = gr_correct/tot_gr*100
-        pct_bp_correct = np.NaN
-    else:
-        for i in range(len(truefiles)):
-            true = np.load(f'{output_dir}/{truefiles[i]}')
-            preds = np.load(f'{output_dir}/{predfiles[i]}')
-            pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
-            tot_pix += len(preds.flatten()) # torch.numel(preds)
+            dm_correct, tot_dm, bp_correct, tot_bp =  np.NaN, np.NaN, np.NaN, np.NaN
+        if n_classes == 3: 
+            ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+            tot_ig += len(np.where(true.flatten() == 0)[0])
+            gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+            tot_gr += len(np.where(true.flatten() == 1)[0])
+            bp_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1.5))[0])
+            tot_bp += len(np.where(true.flatten() == 1.5)[0])
+            dm_correct, tot_dm =  np.NaN, np.NaN
+        if n_classes == 4: 
             ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
             tot_ig += len(np.where(true.flatten() == 0)[0])
             dm_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0.5))[0])
@@ -114,13 +245,187 @@ def compute_validation_results(output_dir, binary=False):
             tot_gr += len(np.where(true.flatten() == 1)[0])
             bp_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1.5))[0])
             tot_bp += len(np.where(true.flatten() == 1.5)[0])
-        pct_correct = pix_correct/tot_pix*100
-        pct_ig_correct = ig_correct/tot_ig*100
-        pct_dm_correct = dm_correct/tot_dm*100
-        pct_gr_correct = gr_correct/tot_gr*100
-        pct_bp_correct = bp_correct/tot_bp*100
+    pct_correct = pix_correct/tot_pix*100
+    pct_ig_correct = ig_correct/tot_ig*100
+    pct_dm_correct = dm_correct/tot_dm*100
+    pct_gr_correct = gr_correct/tot_gr*100
+    pct_bp_correct = bp_correct/tot_bp*100
+
+    # if n_classes == 2:
+    #     for i in range(len(truefiles)):
+    #         true = np.load(f'{output_dir}/{truefiles[i]}')
+    #         preds = np.load(f'{output_dir}/{predfiles[i]}')
+    #         pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+    #         tot_pix += len(preds.flatten()) # torch.numel(preds)
+    #         ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+    #         tot_ig += len(np.where(true.flatten() == 0)[0])
+    #         gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+    #         tot_gr += len(np.where(true.flatten() == 1)[0])
+    #     pct_correct = pix_correct/tot_pix*100
+    #     pct_ig_correct = ig_correct/tot_ig*100
+    #     pct_dm_correct = np.NaN
+    #     pct_gr_correct = gr_correct/tot_gr*100
+    #     pct_bp_correct = np.NaN
+    # elif n_classes == 3:
+    #     for i in range(len(truefiles)):
+    #         true = np.load(f'{output_dir}/{truefiles[i]}')
+    #         preds = np.load(f'{output_dir}/{predfiles[i]}')
+    #         pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+    #         tot_pix += len(preds.flatten()) # torch.numel(preds)
+    #         ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+    #         tot_ig += len(np.where(true.flatten() == 0)[0])
+    #         gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+    #         tot_gr += len(np.where(true.flatten() == 1)[0])
+    #         bp_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1.5))[0])
+    #         tot_bp += len(np.where(true.flatten() == 1.5)[0])
+    #     pct_correct = pix_correct/tot_pix*100
+    #     pct_ig_correct = ig_correct/tot_ig*100
+    #     pct_dm_correct = np.NaN
+    #     pct_gr_correct = gr_correct/tot_gr*100
+    #     pct_bp_correct = bp_correct/tot_bp*100
+    # elif n_classes == 4:
+    #     for i in range(len(truefiles)):
+    #         true = np.load(f'{output_dir}/{truefiles[i]}')
+    #         preds = np.load(f'{output_dir}/{predfiles[i]}')
+    #         fig, axs = plt.subplots(1,2)
+    #         axs[0].imshow(true); axs[1].imshow(preds)
+    #         if i ==5: a=b
+    #         pix_correct += len(np.where(preds.flatten() == true.flatten())[0]) #(preds == true).sum()
+    #         tot_pix += len(preds.flatten()) # torch.numel(preds)
+    #         ig_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0))[0])
+    #         tot_ig += len(np.where(true.flatten() == 0)[0])
+    #         dm_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 0.5))[0])
+    #         tot_dm += len(np.where(true.flatten() == 0.5)[0])
+    #         gr_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1))[0])
+    #         tot_gr += len(np.where(true.flatten() == 1)[0])
+    #         bp_correct += len(np.where((preds.flatten() == true.flatten()) & (true.flatten() == 1.5))[0])
+    #         tot_bp += len(np.where(true.flatten() == 1.5)[0])
+    #     pct_correct = pix_correct/tot_pix*100
+    #     pct_ig_correct = ig_correct/tot_ig*100
+    #     pct_dm_correct = dm_correct/tot_dm*100
+    #     pct_gr_correct = gr_correct/tot_gr*100
+    #     pct_bp_correct = bp_correct/tot_bp*100
 
     return pct_correct, pct_ig_correct, pct_dm_correct, pct_gr_correct, pct_bp_correct
+
+# From https://github.com/AsWali/WNet/blob/master/
+def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=10):
+    channels = 1
+    image = torch.mean(input, dim=1, keepdim=True)
+    h, w = img_size
+    p = radius
+    image = F.pad(input=image, pad=(p, p, p, p), mode='constant', value=0)
+    # Use this to generate random values for the padding.
+    # randomized_inputs = (0 - 255) * torch.rand(image.shape).cuda() + 255
+    # mask = image.eq(0)
+    # image = image + (mask *randomized_inputs)
+    kh, kw = radius*2 + 1, radius*2 + 1
+    dh, dw = 1, 1
+    patches = image.unfold(2, kh, dh).unfold(3, kw, dw)
+    patches = patches.contiguous().view(batch_size, channels, -1, kh, kw)
+    patches = patches.permute(0, 2, 1, 3, 4)
+    patches = patches.view(-1, channels, kh, kw)
+    center_values = patches[:, :, radius, radius]
+    center_values = center_values[:, :, None, None]
+    center_values = center_values.expand(-1, -1, kh, kw)
+    k_row = (torch.arange(1, kh + 1) - torch.arange(1, kh + 1)[radius]).expand(kh, kw)
+    if torch.cuda.is_available():
+        k_row = k_row.cuda()
+    distance_weights = (k_row ** 2 + k_row.T**2)
+    mask = distance_weights.le(radius)
+    distance_weights = torch.exp(torch.div(-1*(distance_weights), ox**2))
+    distance_weights = torch.mul(mask, distance_weights)
+    patches = torch.exp(torch.div(-1*((patches - center_values)**2), oi**2))
+    return torch.mul(patches, distance_weights)
+
+# From https://github.com/AsWali/WNet/blob/master/
+def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5):
+    channels = 1
+    h, w = img_size
+    p = radius
+    kh, kw = radius*2 + 1, radius*2 + 1
+    dh, dw = 1, 1
+    encoding = F.pad(input=enc, pad=(p, p, p, p), mode='constant', value=0)
+    seg = encoding.unfold(2, kh, dh).unfold(3, kw, dw)
+    seg = seg.contiguous().view(batch_size, channels, -1, kh, kw)
+    seg = seg.permute(0, 2, 1, 3, 4)
+    seg = seg.view(-1, channels, kh, kw)
+    nom = weights * seg
+    nominator = torch.sum(enc * torch.sum(nom, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
+    denominator = torch.sum(enc * torch.sum(weights, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
+    return torch.div(nominator, denominator)
+
+# From https://github.com/AsWali/WNet/blob/master/
+def soft_n_cut_loss(image, enc, img_size):
+    loss = []
+    batch_size = image.shape[0]
+    k = enc.shape[1]
+    weights = calculate_weights(image, batch_size, img_size)
+    for i in range(0, k):
+        loss.append(soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size))
+    da = torch.stack(loss)
+    return torch.mean(k - torch.sum(da, dim=0))
+
+# From https://github.com/taoroalin/WNet/blob/master/train.py
+def gradient_regularization(softmax):
+    # THIS SEEMS TO BE EXPECTING CHANNELS DIM BEFORE BATCH DIM????
+    vertical_sobel=torch.nn.Parameter(torch.from_numpy(np.array([[[[1,  0,  -1], 
+                                            [1,  0,  -1], 
+                                            [1,  0,  -1]]]])).float(), requires_grad=False)
+
+    horizontal_sobel=torch.nn.Parameter(torch.from_numpy(np.array([[[[1,   1,  1], 
+                                              [0,   0,  0], 
+                                              [-1 ,-1, -1]]]])).float(), requires_grad=False)
+    print(f'softmax: {softmax.shape}')
+    print(f'softmax.shape[0]: {softmax.shape[0]}')
+    for i in range(softmax.shape[0]):
+        print(f'i {i}')
+        print(f'\tsoftmax[:, i]: {softmax[:, i].shape}')
+    conv = [F.conv2d(softmax[:, i].unsqueeze(1), vertical_sobel) for i in range(softmax.shape[0])]
+    print(f'conv: {np.array(conv).shape}')
+
+
+    vert=torch.cat([F.conv2d(softmax[:, i].unsqueeze(1), vertical_sobel) for i in range(softmax.shape[0])], 1)
+    hori=torch.cat([F.conv2d(softmax[:, i].unsqueeze(1), horizontal_sobel) for i in range(softmax.shape[0])], 1)
+    print('vert', torch.sum(vert))
+    print('hori', torch.sum(hori))
+    mag=torch.pow(torch.pow(vert, 2)+torch.pow(hori, 2), 0.5)
+    mean=torch.mean(mag)
+    return mean
+
+# From Benoit's student's project https://github.com/tremblaybenoit/search/blob/main/src_freeze/loss.py 
+class OpeningLoss2D(nn.Module):
+    r"""Computes the Mean Squared Error between computed class probabilities their grey opening.  Grey opening is a
+    morphology operation, which performs an erosion followed by dilation.  Conceptually, this encourages the network
+    to return sharper boundaries to objects in the class probabilities.
+
+    NOTE:  Original loss term -- not derived from the paper for NCutLoss2D."""
+
+    def __init__(self, radius: int = 2):
+        r"""
+        :param radius: Radius for the channel-wise grey opening operation
+        """
+        super(OpeningLoss2D, self).__init__()
+        self.radius = radius
+
+    def forward(self, labels: torch.Tensor, *args) -> torch.Tensor:
+        r"""Computes the Opening loss -- i.e. the MSE due to performing a greyscale opening operation.
+
+        :param labels: Predicted class probabilities
+        :param args: Extra inputs, in case user also provides input/output image values.
+        :return: Opening loss
+        """
+        smooth_labels = labels.clone().detach().cpu().numpy()
+        for i in range(labels.shape[0]):
+            for j in range(labels.shape[1]):
+                smooth_labels[i, j] = sndi.grey_opening(smooth_labels[i, j], self.radius)
+
+        smooth_labels = torch.from_numpy(smooth_labels.astype(np.float32))
+        if labels.device.type == 'cuda':
+            smooth_labels = smooth_labels.cuda()
+
+        return nn.MSELoss()(labels, smooth_labels.detach())
+
 
 ######## Preprocessing 
 
@@ -300,9 +605,10 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
-def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, bp_min_flux=None, bp_max_size=0.15):
+def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, bp_min_flux=None, bp_max_size=0.15, footprint=250):
     
     """
+    NOT EXACTLY THE SAME AS SUNKIT-IMAGE VERSION (DIFFERENT CLASS LABELS, NPY VS MAP, ADDS MARK_FAC FLAG)
     Segment an optical image of the solar photosphere into four-value maps with:
 
      * 0 as intergranule
@@ -344,7 +650,7 @@ def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=F
 
     # Obtain local histogram equalization of map.
     map_norm = ((map - np.nanmin(map))/(np.nanmax(map) - np.nanmin(map))) * 225 # min-max normalization to [0, 225] 
-    map_HE = sk.filters.rank.equalize(map_norm.astype(int), footprint=sk.morphology.disk(250)) # MAKE FOOTPRINT SIZE DEPEND ON RESOLUTION!!!
+    map_HE = sk.filters.rank.equalize(map_norm.astype(int), footprint=sk.morphology.disk(footprint)) # MAKE FOOTPRINT SIZE DEPEND ON RESOLUTION!!!
     # Apply initial skimage threshold for initial rough segmentation into granules and intergranules.
     median_filtered = sndi.median_filter(map_HE, size=3)
     threshold = get_threshold_v2(median_filtered, skimage_method)
@@ -408,6 +714,7 @@ def trim_intergranules_v2(segmented_image, mark=False):
     ----------
     segmented_image : `numpy.ndarray`
         The segmented image containing incorrect extra intergranules.
+        Will have small padding of zeros around edges.
     mark : `bool`
         If `False` (the default), remove erroneous intergranules.
         If `True`, mark them as 0.5 instead (for later examination).
@@ -420,14 +727,15 @@ def trim_intergranules_v2(segmented_image, mark=False):
 
     if len(np.unique(segmented_image)) > 2:
         raise ValueError("segmented_image must only have values of 1 and 0.")
-    # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG (should not affect final output)
-    segmented_image[:,0:20] = 0 
-    segmented_image[0:20,:] = 0 
-    segmented_image[:,-20:] = 0 
-    segmented_image[-20:,:] = 0 
     segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
+    # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG
+    pad = int(np.shape(segmented_image)[0]/200)
+    segmented_image_fixed[:,0:pad] = 0 
+    segmented_image_fixed[0:pad,:] = 0 
+    segmented_image_fixed[:,-pad:] = 0 
+    segmented_image_fixed[-pad:,:] = 0 
     labeled_seg = skimage.measure.label(segmented_image_fixed + 1, connectivity=2)
-    values = np.unique(labeled_seg)
+    values = np.unique(labeled_seg) 
     # Find value of the large continuous 0-valued region.
     size = 0
     print(f'\tloop 1 to {len(values)} (should take like 2 minutes)')
@@ -445,6 +753,20 @@ def trim_intergranules_v2(segmented_image, mark=False):
                     segmented_image_fixed[labeled_seg == value] = 1
                 elif mark:
                     segmented_image_fixed[labeled_seg == value] = 0.5
+    
+    # segmented_image_return = np.copy(segmented_image)
+    # segmented_image_return[:,0:pad] = segmented_image_fixed[:,0:pad]
+    # segmented_image_return[0:pad,:] = segmented_image_fixed[0:pad,:] 
+    # segmented_image_return[:,-pad:] = segmented_image_fixed[:,-pad:]
+    # segmented_image_return[-pad:,:] = segmented_image_fixed[-pad:,:] 
+    # plt.figure(); im = plt.imshow(segmented_image_fixed, origin='lower'); plt.colorbar(im); plt.title('segmented_image_fixed')
+    # segmented_image_return = np.copy(segmented_image)
+    # fixed = segmented_image_fixed[pad:-pad, pad:-pad] # np.zeros_like(segmented_image_fixed[pad:-pad, pad:-pad])  #
+    # plt.figure(); im = plt.imshow(segmented_image_return, origin='lower'); plt.colorbar(im); plt.title('segmented_image_return')
+    # plt.figure(); im = plt.imshow(fixed, origin='lower'); plt.colorbar(im); plt.title('fixed')
+    # segmented_image_return[pad:-pad, pad:-pad] = fixed # np.random.normal(size=segmented_image_fixed[pad:-pad, pad:-pad].shape) # segmented_image_fixed[pad:-pad, pad:-pad] 
+    # plt.figure(); im = plt.imshow(segmented_image_return, origin='lower'); plt.colorbar(im); plt.title('segmented_image_return')
+    
     return segmented_image_fixed
 
 def mark_faculae_v2b(segmented_image, data, HE_data, resolution, bp_min_flux=None, bp_max_size=0.15):
@@ -491,21 +813,9 @@ def mark_faculae_v2b(segmented_image, data, HE_data, resolution, bp_min_flux=Non
     labeled_bright_dim_seg = skimage.measure.label(bright_dim_seg + 1, connectivity=2)
     values = np.unique(labeled_bright_dim_seg)
 
-    plt.figure()
-    plt.imshow(bright_dim_seg, origin='lower')
-    plt.title('bright_dim_seg')
-    plt.savefig('test_brightdimseg')
-
     # Obtain gradient map and set threshold for gradient on BP edges
     grad = np.abs(np.gradient(data)[0] + np.gradient(data)[1])
     bp_min_grad = np.quantile(grad, 0.95)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-    im = ax1.imshow(data)
-    highgrad = np.empty_like(grad)
-    highgrad[grad>bp_min_grad] = 1
-    im = ax2.imshow(highgrad)
-    plt.savefig('test_gradient')
 
     # Loop through bright regions, select those under pixel limit and containing high gradient
     fac_count = 0
@@ -562,17 +872,6 @@ def mark_faculae_v2(segmented_image, data, resolution, bp_min_flux=None, bp_max_
     segmented_image_fixed = np.copy(segmented_image.astype(float))
     labeled_seg = skimage.measure.label(segmented_image + 1, connectivity=2)
 
-    # fig, ((ax1, ax2, ax3),(ax4, ax5, ax6))= plt.subplots(2, 3, figsize=(15, 10))
-    # im = ax1.imshow(segmented_image[2400:2550, 2150:2450], origin='lower')
-    # im = ax2.imshow(data[2400:2550, 2150:2450], origin='lower')
-    # im = ax3.imshow(labeled_seg[2400:2550, 2150:2450], origin='lower')
-    # ax3.set_title(np.unique(labeled_seg[2400:2550, 2150:2450]))
-    # im = ax4.imshow(segmented_image[2100:2300, 2100:2500], origin='lower')
-    # im = ax5.imshow(data[2100:2300, 2100:2500], origin='lower')
-    # im = ax6.imshow(labeled_seg[2100:2300, 2100:2500], origin='lower')
-    # ax6.set_title(np.unique(labeled_seg[2100:2300, 2100:2500]))
-    # plt.savefig('test0626')
-    # a=b
     values = np.unique(labeled_seg)
     fac_count = 0
     print(f'\tloop 3 to {len(values)} (this is the sticking point)')
@@ -840,16 +1139,16 @@ def mark_faculae(segmented_image, data, resolution):
     gran_count = len(values) - 1 - fac_count  # Subtract 1 for IG region.
     return segmented_image_fixed, fac_count, gran_count
 
-def convert_to_binary(seg):
+def convert_back(seg, to='binary'):
     '''
-    Convert 4-value seg into binary (so that dont have to rerun seg algorithm)
-    Both DM *and* BPs are converted to GR
+    Convert 4-value seg into binary or tri-value (so that dont have to rerun seg algorithm)
+    Both DM *and* BPs (if to=binary) are converted to GR
     '''
-    binseg = np.copy(seg)
-    binseg[seg == 0.5] = 1
-    binseg[seg == 1.5] = 1
+    outseg = np.copy(seg)
+    outseg[seg == 0.5] = 1
+    if to=='binary': outseg[seg == 1.5] = 1
 
-    return binseg
+    return outseg
 
     # #### PLACE THIS CODE WITHIN TRIM_INTERGRGRANULES FUNCTION ###
     # print(real_IG_value)
@@ -871,3 +1170,289 @@ def convert_to_binary(seg):
     # plt.savefig('test0622')
     # a=b
     ###################
+
+######## UPDATES OF SUNKIT-IMAGE VERSIONS OF SEG FUNCTIONS, USING NEW (V2) METHODS ######
+
+import skimage
+import matplotlib
+import scipy
+import logging
+
+def segment_2(smap, *, skimage_method="li", mark_dim_centers=False, bp_min_flux=None):
+    """
+    Segment an optical image of the solar photosphere into tri-value maps with:
+
+     * 0 as intergranule
+     * 1 as granule
+     * 2 as brightpoint
+
+    If mark_dim_centers is set to True, an additional label, 3, will be assigned to
+    dim grnanule centers.
+
+    Parameters
+    ----------
+    smap : `~sunpy.map.GenericMap`
+        `~sunpy.map.GenericMap` containing data to segment. Must have square pixels.
+    skimage_method : {"li", "otsu", "isodata", "mean", "minimum", "yen", "triangle"}, optional
+        scikit-image thresholding method, defaults to "li".
+        Depending on input data, one or more of these methods may be
+        significantly better or worse than the others. Typically, 'li', 'otsu',
+        'mean', and 'isodata' are good choices, 'yen' and 'triangle' over-
+        identify intergranule material, and 'minimum' over identifies granules.
+    mark_dim_centers : `bool`, optional
+        Whether to mark dim granule centers as a separate category for future exploration.
+    bp_min_flux : `float`, optional
+        Minimum flux per pixel for a region to be considered a brightpoint.
+        Default is `None` which will use data mean + 0.5 * sigma.
+
+    Returns
+    -------
+    segmented_map : `~sunpy.map.GenericMap`
+        `~sunpy.map.GenericMap` containing a segmented image (with the original header).
+    """
+    if not isinstance(smap, sunpy.map.mapbase.GenericMap):
+        raise TypeError("Input must be an instance of a sunpy.map.GenericMap")
+    if smap.scale[0].value == smap.scale[1].value:
+        resolution = smap.scale[0].value
+    else:
+        raise ValueError("Currently only maps with square pixels are supported.")
+    # Obtain local histogram equalization of map.
+    if not isinstance(smap, sunpy.map.mapbase.GenericMap):
+        raise TypeError("Input must be an instance of a sunpy.map.GenericMap")
+    if smap.scale[0].value == smap.scale[1].value:
+        resolution = smap.scale[0].value
+    else:
+        raise ValueError("Currently only maps with square pixels are supported.")
+    # Obtain local histogram equalization of map.
+    map_norm = ((smap.data - np.nanmin(smap.data))/(np.nanmax(smap.data) - np.nanmin(smap.data))) # min-max normalization to [0, 1] 
+    map_he = skimage.filters.rank.equalize(skimage.util.img_as_ubyte(map_norm), footprint=skimage.morphology.disk(radius=100))
+    # Apply initial skimage threshold.
+    median_filtered = scipy.ndimage.median_filter(map_he, size=3)
+    threshold = _get_threshold_2(median_filtered, skimage_method)
+    segmented_image = np.uint8(median_filtered > threshold)
+    # Fix the extra intergranule material bits in the middle of granules.
+    seg_im_fixed = _trim_intergranules_2(segmented_image, mark=mark_dim_centers)
+    # Mark brightpoint and get final granule and brightpoint count.
+    seg_im_markbp, brightpoint_count, granule_count = _mark_brightpoint_2(
+        seg_im_fixed, smap.data, map_he, resolution, bp_min_flux
+    )
+    logging.info(f"Segmentation has identified {granule_count} granules and {brightpoint_count} brightpoint")
+    # Create output map using input wcs and adding colormap such that 0 (intergranules) = black, 1 (granule) = white, 2 (brightpoints) = yellow, 3 (dim_centers) = blue.
+    segmented_map = sunpy.map.Map(seg_im_markbp, smap.wcs)
+    cmap = matplotlib.colors.ListedColormap(["black", "white", "#ffc406", "blue"])
+    norm = matplotlib.colors.BoundaryNorm(boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5], ncolors=cmap.N)
+    segmented_map.plot_settings["cmap"] = cmap
+    segmented_map.plot_settings["norm"] = norm
+
+    segmented_map = seg_im_markbp
+
+    return segmented_map
+
+def _get_threshold_2(data, method):
+    """
+    Get the threshold value using given skimage segmentation type.
+
+    Parameters
+    ----------
+    data : `numpy.ndarray`
+        Data to threshold.
+    method : {"li", "otsu", "isodata", "mean", "minimum", "yen", "triangle"}
+        scikit-image thresholding method.
+
+    Returns
+    -------
+    threshold : `float`
+        Threshold value.
+    """
+    if not isinstance(data, np.ndarray):
+        raise ValueError("Input data must be an instance of a np.ndarray")
+    if len(data.flatten()) > 500**2:
+        data = np.random.choice(data.flatten(), (500, 500)) # Computing threshold based on random sample works well and saves significant computatonal time
+    method = method.lower()
+    method_funcs = {
+        "li": skimage.filters.threshold_li,
+        "otsu": skimage.filters.threshold_otsu,
+        "yen": skimage.filters.threshold_yen,
+        "mean": skimage.filters.threshold_mean,
+        "minimum": skimage.filters.threshold_minimum,
+        "triangle": skimage.filters.threshold_triangle,
+        "isodata": skimage.filters.threshold_isodata,
+    }
+    if method not in method_funcs:
+        raise ValueError("Method must be one of: " + ", ".join(list(method_funcs.keys())))
+    threshold = method_funcs[method](data)
+    return threshold
+
+
+def _trim_intergranules_2(segmented_image, mark=False):
+    """
+    Remove the erroneous identification of intergranule material in the middle
+    of granules that the pure threshold segmentation produces.
+
+    Parameters
+    ----------
+    segmented_image : `numpy.ndarray`
+        The segmented image containing incorrect extra intergranules.
+    mark : `bool`
+        If `False` (the default), remove erroneous intergranules.
+        If `True`, mark them as 3 instead (for later examination).
+
+    Returns
+    -------
+    segmented_image_fixed : `numpy.ndarray`
+        The segmented image without incorrect extra intergranules.
+    """
+    if len(np.unique(segmented_image)) > 2:
+        raise ValueError("segmented_image must only have values of 1 and 0.")
+    # Float conversion for correct region labeling.
+    segmented_image_fixed = np.copy(segmented_image).astype(float)
+    # Add padding of intergranule around edges. Aviods the case where all edge pixels are granule, which will result in all dim centers as intergranules.
+    pad = int(np.shape(segmented_image)[0]/200)
+    segmented_image_fixed[:,0:pad] = 0 
+    segmented_image_fixed[0:pad,:] = 0 
+    segmented_image_fixed[:,-pad:] = 0 
+    segmented_image_fixed[-pad:,:] = 0 
+    labeled_seg = skimage.measure.label(segmented_image_fixed + 1, connectivity=2)
+    values = np.unique(labeled_seg)
+    # Find value of the large continuous 0-valued region.
+    size = 0
+    for value in values:
+        if len((labeled_seg[labeled_seg == value])) > size and sum(segmented_image[labeled_seg == value] == 0):
+            real_IG_value = value
+            size = len(labeled_seg[labeled_seg == value])
+    # Set all other 0 regions to mark value (3).
+    for value in values:
+        if np.sum(segmented_image[labeled_seg == value]) == 0:
+            if value != real_IG_value:
+                if not mark:
+                    segmented_image_fixed[labeled_seg == value] = 1
+                elif mark:
+                    segmented_image_fixed[labeled_seg == value] = 3
+    return segmented_image_fixed
+
+
+def _mark_brightpoint_2(segmented_image, data, HE_data, resolution, bp_min_flux=None):
+    """
+    Mark brightpoints separately from granules - give them a value of 2.
+
+    Parameters
+    ----------
+    segmented_image : `numpy.ndarray`
+        The segmented image containing incorrect middles.
+    data : `numpy array`
+        The original image.
+    HE_data : `numpy array`
+        Original image with local histogram equalization applied.
+    resolution : `float`
+        Spatial resolution (arcsec/pixel) of the data.
+    bp_min_flux : `float`, optional
+        Minimum flux per pixel for a region to be considered a brightpoint.
+        Default is `None` which will use data mean + 0.5 * sigma.
+
+    Returns
+    -------
+    segmented_image_fixed : `numpy.ndrray`
+        The segmented image with brightpoints marked as 2.
+    brightpoint_count: `int`
+        The number of brightpoints identified in the image.
+    granule_count: `int`
+        The number of granules identified, after re-classifcation of brightpoint.
+    """
+    # General size limits 
+    bp_size_limit = (
+        0.1  # Approximate max size of a photosphere bright point in square arcsec (see doi 10.3847/1538-4357/aab150)
+    )
+    bp_pix_upper_limit = (bp_size_limit / resolution)**2 # Max area in pixels
+    bp_pix_lower_limit = 4  # Very small bright regions are likely artifacts
+    # General flux limit determined by visual inspection (set using equalized map)
+    if bp_min_flux is None:
+        stand_devs = 1.25
+        bp_brightness_limit = np.nanmean(HE_data) + stand_devs*np.nanstd(HE_data)
+    else:
+        bp_brightness_limit = bp_min_flux
+    if len(np.unique(segmented_image)) > 3:
+        raise ValueError("segmented_image must have only values of 1, 0 and 3 (if dim centers marked)")
+    # Obtain gradient map and set threshold for gradient on BP edges
+    grad = np.abs(np.gradient(data)[0] + np.gradient(data)[1])
+    bp_min_grad = np.quantile(grad, 0.95)
+    # Label all regions of flux greater than brightness limit (candidate regions)
+    bright_dim_seg = np.zeros_like(data)
+    bright_dim_seg[HE_data > bp_brightness_limit] = 1
+    labeled_bright_dim_seg = skimage.measure.label(bright_dim_seg + 1, connectivity=2)
+    values = np.unique(labeled_bright_dim_seg)
+    # From candidate regions, select those within pixel limit and gradient limit
+    segmented_image_fixed = np.copy(segmented_image.astype(float))  # Make type float to enable adding float values
+    bp_count = 0
+    for value in values:
+        if (bright_dim_seg[labeled_bright_dim_seg==value])[0]==1: # Check region is not the non-bp region
+            # check that region is within pixel limits.
+            region_size = len(labeled_bright_dim_seg[labeled_bright_dim_seg==value])
+            if region_size < bp_pix_upper_limit and region_size > bp_pix_lower_limit:
+                # check that region has high average gradient (maybe try max gradient?)
+                region_mean_grad = np.mean(grad[labeled_bright_dim_seg==value])
+                if region_mean_grad > bp_min_grad:
+                    segmented_image_fixed[labeled_bright_dim_seg==value] = 2
+                    bp_count += 1
+    gran_count = len(values) - 1 - bp_count  # Subtract 1 for IG region.
+    return segmented_image_fixed, bp_count, gran_count
+
+
+def segments_overlap_fraction(segment1, segment2):
+    """
+    Compute the fraction of overlap between two segmented SunPy Maps.
+
+        Designed for comparing output Map from `segment` with other segmentation methods.
+
+    Parameters
+    ----------
+    segment1: `~sunpy.map.GenericMap`
+        Main `~sunpy.map.GenericMap` to compare against. Must have 0 = intergranule, 1 = granule.
+    segment2 :`~sunpy.map.GenericMap`
+        Comparison `~sunpy.map.GenericMap`. Must have 0 = intergranule, 1 = granule.
+        As an example, this could come from a simple segment using sklearn.cluster.KMeans
+
+    Returns
+    -------
+    confidence : `float`
+        The numeric confidence metric: 0 = no agreement and 1 = complete agreement.
+    """
+    segment1 = np.array(segment1.data)
+    segment2 = np.array(segment2.data)
+    total_granules = np.count_nonzero(segment1 == 1)
+    total_intergranules = np.count_nonzero(segment1 == 0)
+    if total_granules == 0:
+        raise ValueError("No granules in `segment1`. It is possible the clustering failed.")
+    if total_intergranules == 0:
+        raise ValueError("No intergranules in `segment1`. It is possible the clustering failed.")
+    granule_agreement_count = 0
+    intergranule_agreement_count = 0
+    granule_agreement_count = ((segment1 == 1) * (segment2 == 1)).sum()
+    intergranule_agreement_count = ((segment1 == 0) * (segment2 == 0)).sum()
+    percentage_agreement_granules = granule_agreement_count / total_granules
+    percentage_agreement_intergranules = intergranule_agreement_count / total_intergranules
+    confidence = np.mean([percentage_agreement_granules, percentage_agreement_intergranules])
+    return confidence
+
+#### other ####
+def fits_to_map(filename):
+    """
+    Read .fits file data into a sunpy map.
+    ----------
+    Parameters:
+        filename (string): Path to input data file (.fits format)
+    ----------
+    Returns:
+        data_map: SunPy map containing the data and header
+    """
+
+    try:
+        hdu = fits.open(filename)
+        data = hdu[0].data
+    except FileNotFoundError:
+        raise FileNotFoundError('Cannot find ' + filename)
+    except Exception:
+        raise Exception('Data does not appear to be in correct .fits format')
+
+    data_map = sunpy.map.Map(filename)
+
+    return data_map
