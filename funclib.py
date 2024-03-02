@@ -16,29 +16,39 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 from torch.utils.data import Dataset, TensorDataset, DataLoader
+from tqdm import tqdm
 
 ######## Functions for NNs
 
 # Dataset
 class MyDataset(Dataset):
 
-    def __init__(self, image_dir, mask_dir, norm=False, channels=[], n_classes=2, randomSharp=False, im_size=None):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.images = os.listdir(image_dir)
+    def __init__(self, image_dir, mask_dir, set, norm=False, channels=['X'], n_classes=2, randomSharp=False, im_size=None, no_first=False):
+        self.image_dir = f'{image_dir}{set}'
+        self.mask_dir = f'{mask_dir}{set}'
+        self.set = set
+        self.images = os.listdir(f'{image_dir}{set}')
         self.norm = norm
         self.channels = channels
         self.n_classes = n_classes
         self.randomSharp = randomSharp
         self.im_size = im_size
+        self.transform = transforms.Resize(im_size)
+        self.no_first = no_first
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, index):
         # Get image
-        img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image
-        img = np.load(img_path).newbyteorder().byteswap() 
+        img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image (or SET of [20, npix, npix] if timeseries)
+        img = np.load(img_path)
+        if np.max(img > 1):
+            raise ValueError('This image does not appear to come from a pre-normalized set')
+        if img.dtype.byteorder == '>':
+            img = img.newbyteorder().byteswap() 
+        # if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
+        #     img = np.array(self.transform(torch.from_numpy(np.expand_dims(img, axis=0)))).squeeze()
         if self.randomSharp: # add 50% chance of image being blurred/sharpened by a factor pulled from a skewed guassian (equal chance of 1/4 and 4)
             img =((img - np.nanmin(img))/(np.nanmax(img) - np.nanmin(img))) # first must [0, 1] normalize
             img = torch.from_numpy(np.expand_dims(img, axis=0)) # transforms expect a batch dimension
@@ -46,18 +56,24 @@ class MyDataset(Dataset):
             s = n if np.random.rand(1)[0] < 0.5 else 1/n
             transf = transforms.RandomAdjustSharpness(sharpness_factor=s, p=0.5)
             img = transf(img)[0] # remove batch dimension for now
-        if self.norm:  # normalize 
-            img = (img - np.mean(img))/np.std(img) # normalize to std normal dist
-        if self.channels != []: # Add feature layers
-            image = np.zeros((len(self.channels)+1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
-            image[0, :, :] = img
-            for i in range(len(self.channels)):
-                image[i+1, :, :] = get_feature(img, self.channels[i], index)
+        # if self.norm:  # normalize DONT DO THIS!!!!! INSTEAD USE NPY SECTIONS CREATED FROM NORMED OG FILES!!!!
+        #     img = (img - np.mean(img))/np.std(img) # normalize to std normal dist
+        if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
+            img = np.array(self.transform(torch.from_numpy(np.expand_dims(img, axis=0)))).squeeze()
+        if self.channels != ['X']: # Add feature layers
+            if self.channels[0].startswith('timeseries'):
+                tag = self.channels[0][self.channels[0].find('ies')+3:]
+                image = fill_timeseries(img, tag)
+            else:
+                image = np.zeros((len(self.channels), img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                image[0, :, :] = img
+                for i in range(1, len(self.channels)):
+                    image[i, :, :] = get_feature(img, self.channels[i], index, self.images[index], self.set, img_path, self.transform)
         else: # Add dummy axis
             image = np.zeros((1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
             image[0, :, :] = img
-        if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
-            image = image[:, 0:self.im_size, 0:self.im_size]
+        if self.no_first:
+            image = image[1:, :, :]
         # Get labels
         mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image THIS SHOULD ENSURE ITS THE MASK CORRESPONDING TO THE CORRECT IMAGE
         labels = np.load(mask_path).newbyteorder().byteswap() 
@@ -89,8 +105,571 @@ class MyDataset(Dataset):
             mask[0, :, :] = mask_ig
             mask[1, :, :] = mask_gr
         if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 4 times, for WNet
-            mask = mask[:, 0:self.im_size, 0:self.im_size]
+            #mask = mask[:, 0:self.im_size, 0:self.im_size]
+            mask = np.array(self.transform(torch.from_numpy(mask)))
+
         return image, mask
+
+def fill_timeseries(img, tag):
+    if tag == '20_5':
+        image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
+        image[0, :, :] = img[0, :, :]
+        image[1, :, :] = img[5, :, :]
+        image[2, :, :] = img[10, :, :] # target image (is it important to put this here?)
+        image[3, :, :] = img[15, :, :]
+        image[4, :, :] = img[19, :, :] # should've probabaly done sets of 21.. oh well
+    if tag == '40_5':
+        image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
+        image[0, :, :] = img[0, :, :]
+        image[1, :, :] = img[10, :, :]
+        image[2, :, :] = img[20, :, :] # target image (is it important to put this here?)
+        image[3, :, :] = img[30, :, :]
+        image[4, :, :] = img[40, :, :] # these sets are 41
+    if tag == '40_9':
+        image = np.zeros((9, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
+        image[0, :, :] = img[0, :, :]
+        image[1, :, :] = img[5, :, :]
+        image[2, :, :] = img[10, :, :] 
+        image[3, :, :] = img[15, :, :]
+        image[4, :, :] = img[20, :, :] # target image (is it important to put this here?)
+        image[5, :, :] = img[25, :, :]
+        image[6, :, :] = img[30, :, :]
+        image[7, :, :] = img[35, :, :] 
+        image[8, :, :] = img[40, :, :] # these sets are 41
+    return image
+
+def get_feature(img, name, index, image_name, set, imgpath, transform):
+    if name == 'gradx': a = np.gradient(img)[0]
+    elif name == 'grady': a = np.gradient(img)[1]
+    elif name == 'smoothed': a = scipy.ndimage.gaussian_filter(img, sigma=3)
+    elif 'power' in name:
+        n = int(name[-1])
+        a = img**n
+    # elif name == 'deltaBinImg':
+    #     UNet1seg = np.load(f'../UNet1_outputs/pred_{index}.npy') # zeros and ones
+    #     imgnorm = (img - np.mean(img))/np.std(img) # normalize to range [0, 1]
+    #     a = UNet1seg - imgnorm # difference between binary segmentation and image (pos for bp, neg for dm)
+    elif name == 'binary_residual':
+        im_scaled = (img-np.min(img))/(np.max(img)-np.min(img)) # (im-np.nanmean(im))/np.nanstd(im)
+        if set == 'train':
+            if os.path.exists(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'): # if i've already saved them
+                wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'))
+            else: 
+                model = MyWNet(squeeze=2, ch_mul=64, in_chans=2, out_chans=2)
+                model.load_state_dict(torch.load(f'../NN_storage/WNet8m.pth'))
+                x = np.zeros((1, 2, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                x[0, 0, :, :] = img
+                x[0, 1, :, :] = img**2
+                X = torch.from_numpy(x) # transforms.Resize(128)(torch.from_numpy(x))
+                probs = model(X, returns='enc') # defualt is to return dec, but we want seg
+                wnet8_preds = np.argmax(probs.detach().numpy(), axis=1).astype(float).squeeze() # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+                np.save(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_train/wnet8seg_{index}', wnet8_preds)
+        if set == 'val':
+            wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/pred_{index}.npy'))
+        kernel = np.ones((30,30))/900
+        wnet8_preds_smooth = cv2.filter2D(wnet8_preds, -1, kernel)
+        a = (wnet8_preds_smooth - im_scaled)**2 
+    elif name == 'Bz':
+        mag_path = f'../Data/UNetData_MURaM/mag_images/{set}/{image_name}' # path to one mag image THIS SHOULD ENSURE ITS THE MAG CORRESPONDING TO THE CORRECT IMAGE
+        mag = np.load(mag_path).newbyteorder().byteswap()
+        #a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal dist 
+        mag = mag**2
+        a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal dist
+    elif name == 'median_residual':
+        meddir = f'{imgpath[0:imgpath.find("norm_images/")]}med8_images/{set}/'
+        if os.path.exists(meddir):
+            #imgname = imgpath[imgpath.find("VBI"):]
+            med_path = f'{meddir}med8_{image_name}'
+            med = np.load(med_path)
+            if np.shape(med) != np.shape(img): # already cut down image
+                med = np.array(transform(torch.from_numpy(np.expand_dims(med, axis=0)))).squeeze()
+            a = img - med
+        else: 
+            if set == 'val':
+                s = 8
+                a = img - sndi.median_filter(img, size=s)
+            else:
+                raise FileNotFoundError(f'Median filtered images not saved for this set ({meddir} does not exist).')
+        if 'MURAM' in imgpath: 
+            mean = 0.000368; sd = 0.019967
+            a = (a - mean)/sd
+    else: raise ValueError(f'Channel name {name} not recognized')
+
+    return a
+
+# Containor for multiple layers (for convenience)
+class DoubleConv(nn.Module):
+
+    def __init__(self, in_channels, out_channels):
+
+        # Call init method inherated from nn.Module
+        super(DoubleConv, self).__init__()
+        print('')
+        # Define layer that is a bunch of layers
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding='same', bias=False),
+            nn.BatchNorm2d(out_channels), 
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding='same', bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True))
+
+    def forward(self, x): # this is what gets called when you call DoubleConv
+
+        # print(f'\t\tCalling MyUNet.DoubleConv foward with x shape {x.shape}, with first Conv2d layer {self.conv[0]}')
+        return self.conv(x)
+
+
+# UNet
+class MyUNet(nn.Module):
+
+    def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512],):
+
+        #print('Initializing MyUNet')
+        
+        # Initialize
+        super(MyUNet, self).__init__() # Call init method inherated from nn.Module
+        # Set empty layer type lists
+        self.ups = nn.ModuleList() 
+        self.downs = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) # Define pooling layer (recall: this is not saying the pooling layer is called after the up and down stuff; its just defining the up, down, and pool attributes all together here)
+        # Fill list of down layers 
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature  # after each convolution we set (next) in_channel to (previous) out_channels  
+        # Fill list of up layers 
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2,))
+            self.ups.append(DoubleConv(feature*2, feature))
+        # Define layer at the bottom
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
+        # Define last conv to get correct output num channels
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+        #print('Finished calling _init_')
+    
+
+    def forward(self, x): # this is what gets called when you call MyUNet
+
+        # Initialize list to store skip connections
+        skip_connections = []
+        # Do all the downs in self.downs
+        for down in self.downs:
+            #print(f'\tperforming down {down} ')
+            x = down(x) # the down layers are all MyUNet.DoubleConv, which is a set of layers within a nn.Sequential containor 
+            skip_connections.append(x) # NEED TO LEARN ABOUT SKIP_CONNECTIONS
+            x = self.pool(x)
+        # Perform bottleneck layer
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1] # reverse 
+        # Do all the ups in self.ups
+        for idx in range(0, len(self.ups), 2): # step of 2 becasue add conv step
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx//2]
+            if x.shape != skip_connection.shape:
+                x = TF.resize(x, size=skip_connection.shape[2:], antialias=None)
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx+1](concat_skip)
+
+        return self.final_conv(x)
+
+
+# Function to train one epoch
+def train_UNET(loader, model, optimizer, loss_fn, scaler, dm_weight=1, bp_weight=1, device='cpu'):
+    
+    loop = tqdm(loader) # is this a progress bar? but then below its looping through loop
+
+    # Train on each set in train loader
+    for batch_idx, (data, targets) in enumerate(loop):
+        # set to use device
+        data = data.to(device)
+        targets = targets.float().to(device)
+
+        # forward
+        predictions = model(data) # call model to get predictions (not class probs; contains negs; apply sigmoid to get probs).
+        if isinstance(loss_fn, multiclass_MSE_loss):
+            loss = loss_fn(predictions, targets, dm_weight, bp_weight) # compute loss
+        elif isinstance(loss_fn, nn.CrossEntropyLoss):
+            loss = loss_fn(predictions, targets) # compute loss
+        else: 
+            loss = loss_fn(predictions, targets) # compute loss
+        # backward
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # update tqdm loop
+        loop.set_postfix(loss=loss.item()) #; print(f'\t\tBatch {batch_idx}, {loss_fn}: {loss}')
+
+# Function to calculate validation accuracy after one training epoch
+def validate(val_loader, model, device='cpu'):
+
+    num_correct = 0
+    num_pixels = 0
+    dice_score = 0
+    model.eval() # set model into eval mode
+    with torch.no_grad():
+        for x, y in val_loader:
+            x = x.to(device)
+            y = y.to(device)#.unsqueeze(1)
+            preds = torch.sigmoid(model(x)) # call model to get predictions
+            if preds.shape[1] == 1: # if binary (predictions have 1 layer)
+                preds = (preds > 0.5).float() # turn regression value (between zero and 1, e.g. "prob of being 1") into predicted 0s and 1s
+            else: # if muliclasss (predictions have n_classes layers)
+                preds = np.argmax(preds.detach().numpy(), axis=1) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+                y = np.argmax(y.detach().numpy(), axis=1) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+            num_correct += len(np.where(preds == y)[0]) #(preds == y).sum()
+            num_pixels += len(preds.flatten()) # torch.numel(preds)
+            dice_score += (2 * (preds * y).sum()) / ((preds + y).sum() + 1e-8)
+    accuracy = num_correct/num_pixels*100
+
+    return accuracy, dice_score
+
+# Function to save results of trained model on validation data
+def save_UNET_results(val_loader, save_dir, model):
+    '''
+    Run each validation obs through model, save results
+    True and predicted vals are saved as 2d maps; e.g. compressed back to original seg format
+    '''
+
+    print(f'Loading model back in, saving results on validation data in {save_dir}')
+    if os.path.exists(save_dir) == False: os.mkdir(save_dir)
+    i = 0
+    for X, y in val_loader:
+        X, y = X.to('cpu'), y.to('cpu')
+        preds = torch.sigmoid(model(X))
+        if preds.shape[1] == 2: # if binary (predictions have 2 layers) 
+            preds = (preds > 0.5).float() # turn regression value (between zero and 1, e.g. "prob of being 1") into predicted 0s and 1s
+            preds = preds.detach().numpy()[:,0,:,:] # NOTE: currently I am still constructing binary inputs/truths as 2 layers where second is just dummy layer
+            y = y.detach().numpy()[:,0,:,:] # NOTE: currently I am still constructing binary inputs/truths as 2 layers where second is just dummy layer
+        elif preds.shape[1] == 3: # if 3 classs (predictions have 4 layers)
+            preds = np.argmax(preds.detach().numpy(), axis=1).astype(np.float) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+            y = np.argmax(y.detach().numpy(), axis=1).astype(np.float) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+            preds[preds == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
+            y[y == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
+        elif preds.shape[1] == 4: # if 4 classs (predictions have 4 layers)
+            preds = np.argmax(preds.detach().numpy(), axis=1) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+            y = np.argmax(y.detach().numpy(), axis=1) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+            preds = preds/2 # change from idx to class value 0 -> 0 (IG), 1 -> 0.5 (DM), 2 -> 1 (G), 3 -> 1.5 (BP)
+            y = y/2 # change from idx to class value 0 -> 0 (IG), 1 -> 0.5 (DM), 2 -> 1 (G), 3 -> 1.5 (BP)
+        for j in range(np.shape(preds)[0]):
+            np.save(f'{save_dir}/x_{i}', np.array(X[j]))
+            np.save(f'{save_dir}/true_{i}', np.array(y[j]))
+            np.save(f'{save_dir}/pred_{i}', np.array(preds[j]))
+            i += 1
+
+
+# Container for multiple layers
+class Block(nn.Module):
+    def __init__(self, in_filters, out_filters, seperable=True, padding_mode=None):
+        super(Block, self).__init__()
+        
+        if seperable:
+            self.spatial1=nn.Conv2d(in_filters, in_filters, kernel_size=3, groups=in_filters, padding=1, padding_mode=padding_mode)
+            self.depth1=nn.Conv2d(in_filters, out_filters, kernel_size=1, padding_mode=padding_mode)
+            self.conv1=lambda x: self.depth1(self.spatial1(x))
+            self.spatial2=nn.Conv2d(out_filters, out_filters, kernel_size=3, padding=1, groups=out_filters, padding_mode=padding_mode)
+            self.depth2=nn.Conv2d(out_filters, out_filters, kernel_size=1, padding_mode=padding_mode)
+            self.conv2=lambda x: self.depth2(self.spatial2(x))
+            
+        else:
+            self.conv1=nn.Conv2d(in_filters, out_filters, kernel_size=3, padding=1, padding_mode=padding_mode)
+            self.conv2=nn.Conv2d(out_filters, out_filters, kernel_size=3, padding=1, padding_mode=padding_mode)
+
+        # self.relu1 = nn.ReLU(); self.dropout1 = nn.Dropout(0.65)  # from reproduction
+        self.batchnorm1=nn.BatchNorm2d(out_filters)
+        # self.relu2 = nn.ReLU(); self.dropout2 = nn.Dropout(0.65)  # from reproduction
+        self.batchnorm2=nn.BatchNorm2d(out_filters) 
+
+    def forward(self, x):
+
+        x=self.batchnorm1(self.conv1(x)).clamp(0) 
+        # x = self.relu1(x); x = self.dropout1(x)  # from reproduction
+        x=self.batchnorm2(self.conv2(x)).clamp(0)
+        # x = self.relu2(x); x = self.dropout2(x)  # from reproduction
+
+        return x
+
+# Encoder UNet
+class UEnc(nn.Module):
+    def __init__(self, squeeze, ch_mul=64, in_chans=3, padding_mode=None):
+        super(UEnc, self).__init__()
+        
+        self.enc1=Block(in_chans, ch_mul, seperable=False, padding_mode=padding_mode)
+        self.enc2=Block(ch_mul, 2*ch_mul, padding_mode=padding_mode)
+        self.enc3=Block(2*ch_mul, 4*ch_mul, padding_mode=padding_mode)
+        self.enc4=Block(4*ch_mul, 8*ch_mul, padding_mode=padding_mode)
+        
+        self.middle=Block(8*ch_mul, 16*ch_mul, padding_mode=padding_mode)
+        
+        self.up1=nn.ConvTranspose2d(16*ch_mul, 8*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1) # padding_mode only allowed to be 'zeros'
+        self.dec1=Block(16*ch_mul, 8*ch_mul, padding_mode=padding_mode)
+        self.up2=nn.ConvTranspose2d(8*ch_mul, 4*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec2=Block(8*ch_mul, 4*ch_mul, padding_mode=padding_mode)
+        self.up3=nn.ConvTranspose2d(4*ch_mul, 2*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec3=Block(4*ch_mul, 2*ch_mul, padding_mode=padding_mode)
+        self.up4=nn.ConvTranspose2d(2*ch_mul, ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec4=Block(2*ch_mul, ch_mul, seperable=False, padding_mode=padding_mode)
+        
+        self.final=nn.Conv2d(ch_mul, squeeze, kernel_size=(1, 1), padding_mode=padding_mode) # self.final=nn.Conv2d(ch_mul, squeeze, kernel_size=(1, 1)); self.softmax = nn.Softmax2d()
+        
+    def forward(self, x): 
+        
+        enc1=self.enc1(x) # [16, 1, 140, 140] -> [16, 64, 140, 140]  
+        enc2=self.enc2(F.max_pool2d(enc1, (2,2))) # [16, 64, 140, 140] -> [16, 128, 70, 70]         
+        enc3=self.enc3(F.max_pool2d(enc2, (2,2))) # [16, 128, 70, 70] -> [16, 256, 35, 35]         
+        enc4=self.enc4(F.max_pool2d(enc3, (2,2))) # [16, 256, 35, 35] -> [16, 512, 17, 17] 
+        
+        middle=self.middle(F.max_pool2d(enc4, (2,2))) # [16, 512, 17, 17] -> [16, 1024, 8, 8]
+        
+        up1=torch.cat([enc4, self.up1(middle)], 1) # [16, 512, 17, 17] + self.up1(middle):[16, 512, 16, 16] 
+        dec1=self.dec1(up1)
+        up2=torch.cat([enc3, self.up2(dec1)], 1)
+        dec2=self.dec2(up2)
+        up3=torch.cat([enc2, self.up3(dec2)], 1)
+        dec3=self.dec3(up3)
+        up4=torch.cat([enc1, self.up4(dec3)], 1)
+        dec4=self.dec4(up4)
+        
+        final=self.final(dec4)
+
+        # print(f'x {x.shape}')
+        # print(f'enc1 {enc1.shape}')
+        # print(f'enc2 {enc2.shape}')
+        # print(f'enc3 {enc3.shape}')
+        # print(f'enc4 {enc4.shape}')
+        # print(f'middle {middle.shape}')
+        # print(f'up1 {up1.shape}')
+        # print(f'dec1 {dec1.shape}')
+        # print(f'up2 {up2.shape}')
+        # print(f'dec2 {dec2.shape}')
+        # print(f'up3 {up3.shape}')
+        # print(f'dec3 {dec3.shape}')
+        # print(f'up4 {up4.shape}')
+        # print(f'dec4 {dec4.shape}')
+        # print(f'final {final.shape}')
+        
+        return final
+
+# Decoder UNet
+class UDec(nn.Module):
+    def __init__(self, squeeze, ch_mul=64, in_chans=3, padding_mode=None):
+        super(UDec, self).__init__()
+        
+        self.enc1=Block(squeeze, ch_mul, seperable=False, padding_mode=padding_mode)
+        self.enc2=Block(ch_mul, 2*ch_mul, padding_mode=padding_mode)
+        self.enc3=Block(2*ch_mul, 4*ch_mul, padding_mode=padding_mode)
+        self.enc4=Block(4*ch_mul, 8*ch_mul, padding_mode=padding_mode)
+        
+        self.middle=Block(8*ch_mul, 16*ch_mul, padding_mode=padding_mode)
+        
+        self.up1=nn.ConvTranspose2d(16*ch_mul, 8*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1) # padding_mode only allowed to be 'zeros'
+        self.dec1=Block(16*ch_mul, 8*ch_mul, padding_mode=padding_mode)
+        self.up2=nn.ConvTranspose2d(8*ch_mul, 4*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec2=Block(8*ch_mul, 4*ch_mul, padding_mode=padding_mode)
+        self.up3=nn.ConvTranspose2d(4*ch_mul, 2*ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec3=Block(4*ch_mul, 2*ch_mul, padding_mode=padding_mode)
+        self.up4=nn.ConvTranspose2d(2*ch_mul, ch_mul, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec4=Block(2*ch_mul, ch_mul, seperable=False, padding_mode=padding_mode)
+        
+        self.final=nn.Conv2d(ch_mul, in_chans, kernel_size=(1, 1), padding_mode=padding_mode)
+        
+    def forward(self, x):
+        
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(F.max_pool2d(enc1, (2,2)))
+        enc3 = self.enc3(F.max_pool2d(enc2, (2,2)))
+        enc4 = self.enc4(F.max_pool2d(enc3, (2,2)))
+        
+        middle = self.middle(F.max_pool2d(enc4, (2,2)))
+        
+        up1 = torch.cat([enc4, self.up1(middle)], 1)
+        dec1 = self.dec1(up1)
+        up2 = torch.cat([enc3, self.up2(dec1)], 1)
+        dec2 = self.dec2(up2)
+        up3 = torch.cat([enc2, self.up3(dec2)], 1)
+        dec3 =self.dec3(up3)
+        up4 = torch.cat([enc1, self.up4(dec3)], 1)
+        dec4 = self.dec4(up4)
+        
+        final=self.final(dec4)
+        
+        return final
+
+# WNet
+class MyWNet(nn.Module):
+
+    def __init__(self, squeeze, ch_mul=64, in_chans=3, out_chans=1000, padding_mode=None): # 1000 is just a placeholder but idk when its used
+        super(MyWNet, self).__init__()
+        if out_chans==1000:
+            out_chans=in_chans
+        self.padding_mode = padding_mode
+        self.UEnc=UEnc(squeeze, ch_mul, in_chans, padding_mode)
+        self.UDec=UDec(squeeze, ch_mul, out_chans, padding_mode)
+
+    def forward(self, x, returns='dec'):
+        enc = self.UEnc(x)
+        if returns=='enc':
+            return enc
+        dec=self.UDec(F.softmax(enc, 1))
+        if returns=='dec':
+            return dec
+        elif returns=='both':
+            return enc, dec
+
+# Reconstruction loss
+def multichannel_MSE_loss(x, x_prime, weights):
+    # MSE loss but with ability to weight loss from each channel differently
+
+    loss = 0
+    for channel in range(x.shape[1]):
+        mse = nn.MSELoss()(x[:,channel,:,:], x_prime[:,channel,:,:])
+        loss += weights[channel]*mse
+    loss = loss/(x.shape[1])
+
+    return loss
+
+# Function to train one batch 
+def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_loss, psi=0.5, device='cpu', train_enc_sup=False, labels=None, freeze_dec=False, target_pos=0, weights=None):
+
+    softmax = nn.Softmax2d()
+    smoothLoss = OpeningLoss2D()
+
+    # set to use device
+    input = input.to(device) 
+
+    enc = model(input, returns='enc') # predict seg of k="squeeze" classes (NOT n_classes classes)
+    if train_enc_sup: # if running supervised (UNet)
+        # enc_loss = MSE_loss(enc, labels)
+        bp_weight = 5 # dm_weight = 4
+        loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([1,1,bp_weight]))
+        enc_loss = loss_fn(enc, labels)
+    else:
+        smooth_wght = 10 if k > 2 else 10 # for binary, smaller smooth loss works better (?)
+        n_cut_loss = soft_n_cut_loss(input,  softmax(enc),  img_size)    # from reproduction
+        if (smooth_loss and not blob_loss):
+            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + 10*n_cut_loss # lets try a bigger weight to the smooth loss (11/8) (was 1e-1 I think)
+        if (smooth_loss and blob_loss):
+            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + 10*n_cut_loss + 1e-1*blobloss(enc)
+            #print(f'smooth loss: {10*smoothLoss(softmax(enc))}, n cut loss: {10*n_cut_loss}, blob loss: {blobloss(enc)}')
+        else:
+            enc_loss = n_cut_loss
+    if torch.isnan(enc_loss).any() == True: 
+        fig, axs = plt.subplots(1,3)
+        axs[0].imshow(input[-1,target_pos,:,:]) # last img in batch, first channel
+        axs[1].imshow(input[-1,1,:,:]) # last img in batch, second channel
+        axs[2].imshow(np.argmax(enc[-1,:,:,:].detach().numpy(), axis=0)) # seg for last img in batch
+        raise ValueError('enc loss has become NaN')
+    enc_loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    example_seg = np.argmax(enc[-1,:,:,:].detach().numpy(), axis=0) # seg for last img in batch
+
+    if freeze_dec:
+        rec_loss = torch.tensor(np.NaN)
+        example_rec = np.zeros_like(example_seg)*np.NaN
+        example_rec2 = None
+    else:
+        dec = model(input, returns='dec') # predict image [INCLUDES ALL CHANNELS]
+        rec_loss = multichannel_MSE_loss(input, dec, weights)  # from reprod (MSELoss betwn input and rec imag) BUT with added channel weights
+        # rec_loss=torch.mean(torch.pow(torch.pow(input, 2) + torch.pow(dec, 2), 0.5))*(1-psi)
+        if torch.isnan(rec_loss).any() == True: raise ValueError('rec loss has become NaN')
+        rec_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        example_rec = dec[-1,target_pos,:,:].cpu().detach().numpy() # rec image for last img in batch 
+        if dec.shape[1] == 2: # if only two channels, want to plot both
+            example_rec2 = dec[-1,1,:,:].cpu().detach().numpy() # rec channel2 for last img in batch 
+        else: example_rec2 = None 
+
+    return model, enc_loss, rec_loss, example_seg, example_rec, example_rec2
+
+# Function to train one epoch
+def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_name, smooth_loss, blob_loss, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None):
+    
+    # Create empty lists to collect losses and example segs and recs and corresponding imgs from each batch 
+    enc_losses = []
+    rec_losses = []
+    example_imgs = [] # yes.. could access through dataloader later instead of storing
+    example_segs = []
+    example_recs = []
+    example_img2s = []
+    example_rec2s = []
+
+    # Train on each batch in train loader
+    for (idx, batch) in enumerate(dataloader):
+        print(f'\t   batch {idx}', end='\r')
+        
+        # Train one batch
+        X = batch[0] # batch is [images, labels]
+        y = batch[1] # only used if train_enc_sup = True
+        wnet, enc_loss, rec_loss, example_seg, example_rec, example_rec2, = train_op(wnet, optimizer, X, k, img_size, smooth_loss=smooth_loss, blob_loss=blob_loss, batch_num=idx, device=device, train_enc_sup=train_enc_sup, labels=y, freeze_dec=freeze_dec, target_pos=target_pos, weights=weights)
+        enc_losses.append(enc_loss.detach())
+        rec_losses.append(rec_loss.detach())
+        example_segs.append(example_seg)
+        example_recs.append(example_rec)
+        example_imgs.append(X[-1,target_pos,:,:]) # last img in batch, first channel
+        if X.shape[1] == 2: # if two channels
+            example_rec2s.append(example_rec2)
+            example_img2s.append(X[-1,1,:,:])
+
+    # Plot example imgs from each batch 
+    cols = 3 if len(example_img2s) == 0 else 5 # if I've stored second rec and image channels
+    fig, axs = plt.subplots(len(example_segs), cols, figsize=(cols*3, len(example_segs)*1.5))
+    axs[0, 0].set_title('last img, target ch')
+    if cols == 3:
+        axs[0, 1].set_title('seg (argmax enc)')
+        axs[0, 2].set_title('reconstructed [target ch]')
+        for i in range(len(example_segs)):
+            axs[i,0].set_ylabel(f'Batch {i}')
+            axs[i,0].imshow(example_imgs[i], vmin=0, vmax=1) #(X[-1,i,:,:])
+            axs[i,1].imshow(example_segs[i])
+            axs[i,2].imshow(example_recs[i])
+    if cols == 5: 
+        axs[0, 1].set_title('last img, 2nd ch')
+        axs[0, 2].set_title('seg (argmax enc)')
+        axs[0, 3].set_title('rec, target ch')
+        axs[0, 4].set_title('rec, 2nd ch')
+        for i in range(len(example_segs)):
+            axs[i,0].set_ylabel(f'Batch {i}')
+            axs[i,0].imshow(example_imgs[i], vmin=0, vmax=1) #(X[-1,i,:,:])
+            axs[i,1].imshow(example_img2s[i], vmin=0, vmax=1)
+            axs[i,2].imshow(example_segs[i])
+            axs[i,3].imshow(example_recs[i])
+            axs[i,4].imshow(example_rec2s[i])
+    for i in range(len(example_segs)):
+        for j in range(cols):
+            axs[i,j].xaxis.set_tick_params(labelbottom=False); axs[i,j].yaxis.set_tick_params(labelleft=False); axs[i,j].set_xticks([]); axs[i,j].set_yticks([])
+    plt.savefig(f'../NN_storage/{WNet_name}_epoch{epoch}_examples'); plt.close()
+    enc_losses.append(torch.mean(torch.FloatTensor(enc_losses)))
+    rec_losses.append(torch.mean(torch.FloatTensor(rec_losses)))
+
+    return enc_losses, rec_losses
+
+
+# Function to Run each validation obs through model, save results. True and predicted vals are saved as 2d maps; e.g. compressed back to original seg format
+def save_WNET_results(val_loader, save_dir, model, target_pos=0):
+
+    print(f'Loading model back in, saving results on validation data in {save_dir}')
+    if os.path.exists(save_dir) == False: os.mkdir(save_dir)
+    i = 0
+    for X, y in val_loader:
+
+        X, y = X.to('cpu'), y.to('cpu')
+        probs = model(X, returns='enc') # defualt is to return dec, but we want seg
+        preds = np.argmax(probs.detach().numpy(), axis=1).astype(float) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+        y = np.argmax(y.detach().numpy(), axis=1).astype(np.float) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+        if probs.shape[1] == 3: # if 3 classs (predictions have 4 layers)
+            preds[preds == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
+            y[y == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
+        elif probs.shape[1] == 4: # if 4 classs (predictions have 4 layers)
+            preds = preds/2 # change from idx to class value 0 -> 0 (IG), 1 -> 0.5 (DM), 2 -> 1 (G), 3 -> 1.5 (BP)
+            y = y/2 # change from idx to class value 0 -> 0 (IG), 1 -> 0.5 (DM), 2 -> 1 (G), 3 -> 1.5 (BP)
+        for j in range(np.shape(preds)[0]): # loop through batch 
+            np.save(f'{save_dir}/x_{i}', np.array(X[j]))
+            np.save(f'{save_dir}/true_{i}', np.array(y[j]))
+            np.save(f'{save_dir}/pred_{i}', np.array(preds[j]))
+            i += 1
 
 def probs_to_preds(probs):
     '''
@@ -119,6 +698,9 @@ def onehot_to_map(y):
     return y
 
 class multiclass_MSE_loss(nn.Module):
+    '''
+    DONT USE THIS - IT DOESNT SEEM TO BE WORKING 
+    '''
 
     def __init__(self):
         super(multiclass_MSE_loss, self).__init__()
@@ -142,7 +724,12 @@ class multiclass_MSE_loss(nn.Module):
         """
 
         probs = torch.sigmoid(outputs) # use sigmiod to turn into class probs
-        preds =  probs_to_preds(probs) # JUST ADDED - WILL IT FIX IT?
+        # preds =  probs_to_preds(probs) # JUST ADDED - WILL IT FIX IT?
+
+        # print(f'preds.shape: {preds.shape}')
+        # print(f'targets.shape: {targets.shape}')
+        preds = probs
+
         mse = nn.MSELoss()
         n_classes = len(targets[0,:,0,0])
         if n_classes == 3:
@@ -161,6 +748,19 @@ class multiclass_MSE_loss(nn.Module):
                 mse_bp += mse(targets[idx,3,:,:], preds[idx,3,:,:]) * bp_weight
             loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
         return loss
+    
+def blobloss(outputs):
+    # Metric describing how much the classes group pixels into circular blobs vs long shapes (e.g. outlines of other blobs)
+    # Is this sort of forcing it too much?
+    # So it seems to just be doing this by shrinking the granule/BP regions - still somewhat choppy edges
+    preds = np.argmax(outputs.detach().numpy(), axis=1) # take argmax along classes axis
+    edge_pix = 0
+    for batch in range(preds.shape[0]):
+        cv2.imwrite("temp_img.png", preds[batch,:,:]) 
+        edges = np.array(cv2.Canny(cv2.imread("temp_img.png"),0,1.5))
+        edge_pix += len(edges[edges > 0])
+    loss = edge_pix/(preds.shape[0]*preds.shape[1]**2)
+    return loss
 
 def check_inputs(train_ds, train_loader, savefig=False, name=None):
 
@@ -173,32 +773,18 @@ def check_inputs(train_ds, train_loader, savefig=False, name=None):
     shape = train_labels.size()
     print(f'     Each batch has labels of shape {train_labels.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (classes)')
     if savefig:
-        fig, ((ax1, ax2), (ax3, ax4), (ax5, ax6), (ax7, ax8)) = plt.subplots(4, 2, figsize=(2*4, 4*4)); axs = [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]
-        ax1.set_title('image')
-        ax2.set_title('labels')
-        for i in range(0, 8, 2):
+        fig, axs = plt.subplots(7, 3, figsize=(3*4, 7*4))
+        axs[0,0].set_title('image[0]')
+        #ax2.set_title('image[1]')
+        axs[0,2].set_title('labels')
+        for i in range(7):
             X, y = next(iter(train_loader))
             y = onehot_to_map(y)
-            im1 = axs[i].imshow(X[0,0,:,:]); plt.colorbar(im1, ax=axs[i]) # first img in batch, first channel
-            im2 = axs[i+1].imshow(y[0,:,:]); plt.colorbar(im2, ax=axs[i+1]) # first y in batch, already class-collapsed
-        plt.savefig(f'traindata_{name}')
+            im1 = axs[i,0].imshow(X[0,0,:,:], vmin=0, vmax=1); plt.colorbar(im1, ax=axs[i,0]) # first img in batch, first channel
+            if X.shape[1] > 1: im2 = axs[i,1].imshow(X[0,1,:,:], vmin=0, vmax=1); plt.colorbar(im2, ax=axs[i,1]) # first img in batch, first channel
+            im3 = axs[i,2].imshow(y[0,:,:]); plt.colorbar(im3, ax=axs[i,2]) # first y in batch, already class-collapsed
+        plt.savefig(f'traindata_{name}'); a=b
 
-
-def get_feature(img, name, index):
-
-    if name == 'gradx': a = np.gradient(img)[0]
-    elif name == 'grady': a = np.gradient(img)[1]
-    elif name == 'squared': a = img**2
-    elif 'power' in name:
-        n = int(name[-1])
-        a = img**n
-    # elif name == 'deltaBinImg':
-    #     UNet1seg = np.load(f'../UNet1_outputs/pred_{index}.npy') # zeros and ones
-    #     imgnorm = (img - np.mean(img))/np.std(img) # normalize to range [0, 1]
-    #     a = UNet1seg - imgnorm # difference between binary segmentation and image (pos for bp, neg for dm)
-    else: raise ValueError(f'Channel name {name} not recognized')
-
-    return a
 
 def compute_validation_results(output_dir, n_classes=2):
     '''
@@ -338,7 +924,7 @@ def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=1
     patches = torch.exp(torch.div(-1*((patches - center_values)**2), oi**2))
     return torch.mul(patches, distance_weights)
 
-# From https://github.com/AsWali/WNet/blob/master/
+# From https://github.com/AsWali/WNet/blob/master/utils
 def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5):
     channels = 1
     h, w = img_size
@@ -355,7 +941,7 @@ def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5):
     denominator = torch.sum(enc * torch.sum(weights, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
     return torch.div(nominator, denominator)
 
-# From https://github.com/AsWali/WNet/blob/master/
+# From https://github.com/AsWali/WNet/blob/master/utils
 def soft_n_cut_loss(image, enc, img_size):
     loss = []
     batch_size = image.shape[0]
@@ -531,7 +1117,7 @@ def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
     Y = preprocessing.LabelEncoder().fit_transform(Y) # turn floats 0, 1, to categorical 0, 1
     return X, Y
 
-def post_process(preds, data):
+def post_process(preds, data=None):
 
     preds = np.copy(preds).astype(float)  # Float conversion for correct region numbering.
     preds2 = np.ones_like(preds)*20 # Just to aviod issues later on 
@@ -605,10 +1191,10 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 
 ######## Functions from DKISTSegmentation project for validation of ML methods ###########
 
-def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, bp_min_flux=None, bp_max_size=0.15, footprint=250):
+def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=False, mark_BP=True, bp_min_flux=None, bp_max_size=0.15, footprint=250, pad=None):
     
     """
-    NOT EXACTLY THE SAME AS SUNKIT-IMAGE VERSION (DIFFERENT CLASS LABELS, NPY VS MAP, ADDS MARK_FAC FLAG)
+    NOT EXACTLY THE SAME AS SUNKIT-IMAGE VERSION (DIFFERENT CLASS LABELS, NPY VS MAP, ADDS MARK_FAC FLAG, ADD PAD ARGUEMENT TO ADJUST PAD)
     Segment an optical image of the solar photosphere into four-value maps with:
 
      * 0 as intergranule
@@ -638,6 +1224,9 @@ def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=F
     bp_max_size: `float`
         Maximum diameter (arcsec) to consider a region a Bright Point.
         Defualt of 0.15. 
+    pad: `int`
+        Number of pixels to remove from each edge of the image.
+        Default is image length / 200
 
     Returns
     -------
@@ -656,7 +1245,7 @@ def segment_array_v2(map, resolution, *, skimage_method="li", mark_dim_centers=F
     threshold = get_threshold_v2(median_filtered, skimage_method)
     segmented_image = np.uint8(median_filtered > threshold)
     # Fix the extra intergranule material bits in the middle of granules.
-    seg_im_fixed = trim_intergranules_v2(segmented_image, mark=mark_dim_centers)
+    seg_im_fixed = trim_intergranules_v2(segmented_image, mark=mark_dim_centers, pad=pad)
     # Mark faculae and get final granule and facule count.
     if mark_BP: seg_im_markfac, faculae_count, granule_count = mark_faculae_v2b(seg_im_fixed, map, map_HE, resolution, bp_min_flux, bp_max_size)
     else: seg_im_markfac = seg_im_fixed
@@ -705,7 +1294,7 @@ def get_threshold_v2(data, method):
     #     raise ValueError("Method must be one of: " + ", ".join(METHODS))
     return threshold
 
-def trim_intergranules_v2(segmented_image, mark=False):
+def trim_intergranules_v2(segmented_image, mark=False, pad=None):
     """
     Remove the erroneous identification of intergranule material in the middle
     of granules that the pure threshold segmentation produces.
@@ -718,6 +1307,9 @@ def trim_intergranules_v2(segmented_image, mark=False):
     mark : `bool`
         If `False` (the default), remove erroneous intergranules.
         If `True`, mark them as 0.5 instead (for later examination).
+    pad : `int`
+        Number of pixels to remove from each edge of the image.
+        Default is image length / 200
 
     Returns
     -------
@@ -729,7 +1321,8 @@ def trim_intergranules_v2(segmented_image, mark=False):
         raise ValueError("segmented_image must only have values of 1 and 0.")
     segmented_image_fixed = np.copy(segmented_image).astype(float)  # Float conversion for correct region labeling.
     # Add padding of IG around edges, because if edges are all GR, will ID all DM as IG
-    pad = int(np.shape(segmented_image)[0]/200)
+    if pad == None:
+        pad = int(np.shape(segmented_image)[0]/100)
     segmented_image_fixed[:,0:pad] = 0 
     segmented_image_fixed[0:pad,:] = 0 
     segmented_image_fixed[:,-pad:] = 0 
