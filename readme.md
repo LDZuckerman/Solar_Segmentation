@@ -1,3 +1,5 @@
+NOTE: this is an ongoing project and is still under development.
+
 ## Motivation
 
 Classical methods of segmenting features within the photosphere rely on simple, empirically-driven, rule-based algorithms. These can provide wildly inconsistent results, and are highly sensitive to variability in image resolution and quality. What's more, they do not incorporate the physics underlying photospheric structure, and thus cannot in an of themselves tell us anything meaningfull about these features. 
