@@ -2,7 +2,7 @@ NOTE: this is an ongoing project and is still under development.
 
 ## Motivation
 
-Classical methods of segmenting features within the photosphere rely on simple, empirically-driven, rule-based algorithms. These can provide wildly inconsistent results, and are highly sensitive to variability in image resolution and quality. What's more, they do not incorporate the physics underlying photospheric structure, and thus cannot in an of themselves tell us anything meaningfull about these features. 
+Classical methods of segmenting features within the photosphere rely on rule-based algorithms, which can provide wildly inconsistent results. They also do not incorporate the physics underlying photospheric structure, and thus cannot in an of themselves tell us anything meaningfull about these features. 
 
 Unsupervised models learn their own definitions of features. Using an unsupervised (or semi-supervised) approach, I explore the properties intrinsic to these features, and aim to create a more nuance and scientifically interesting framework for photospheric feature segmentation. 
 
