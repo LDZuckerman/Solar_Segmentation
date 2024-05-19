@@ -5,16 +5,29 @@ import numpy as np
 from utils import funclib
 import argparse
 import json
+import os, shutil
 
 # Read in arguements
 parser = argparse.ArgumentParser()
 parser.add_arguement("-f", "--f", type=str, required=True)
 args = parser.parse_args()
 
-# Load construction dictionary from file
+# Load construction dictionary from exp file
 d = json.load(open(args.f, 'rb'))
 WNet_name = d['Name'] 
 outdir = f"../WNET_runs/{WNet_name}/" 
+if not os.path.exists(outdir): 
+    os.makedirs(outdir)
+
+# Copy exp dict file for convenient future reference
+listfile = '../WNet_runs/exp_dicts.json'
+if not os.path.exists(listfile):
+    os.makedirs(listfile)
+    exp_list = []
+else:
+    exp_list = json.load(open(listfile, 'rb'))
+exp_list.append(d)
+json.dump(exp_list, listfile)
 
 # Get data # TRUTH DATA NOT USED, SO SHOULD REMOVE FROM LOAD-IN
 print(f"Loading data from {d['img_dir']}")
@@ -29,7 +42,7 @@ funclib.check_inputs(train_ds, train_loader, savefig=False, name=WNet_name)
 
 # Define model and optimizer
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = funclib.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['replicate']).to(device)
+model = funclib.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['padding_model']).to(device)
 optimizer = torch.optim.SGD(model.parameters(), lr=d["learning_rate"])
 
 # Run for every epoch
@@ -37,16 +50,9 @@ n_cut_losses_avg = []
 rec_losses_avg = []
 print(f"Training WNet {WNet_name}")
 for epoch in range(d['num_epochs']):
-    
-    # Train (returning losses)
-    train_enc_sup = True if epoch < d['num_sup'] else False
-    if epoch >= d['num_sup']: freeze_dec = False
-    print(f'\tEpoch {epoch}, ({f"supervised, freeze_dec={freeze_dec}" if train_enc_sup==True else f"unsupervised, freeze_dec={freeze_dec}"})')
-    enc_losses, rec_losses = funclib.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), WNet_name=WNet_name, smooth_loss=d['smooth_loss'] , blob_loss=d['blob_loss'], epoch=epoch,  device=device, train_enc_sup=train_enc_sup, freeze_dec=freeze_dec, target_pos=target_pos, weights=d['weights'])
-
-# Add losses to avg losses
-n_cut_losses_avg.append(torch.mean(torch.FloatTensor(enc_losses)))
-rec_losses_avg.append(torch.mean(torch.FloatTensor(rec_losses)))
+    enc_losses, rec_losses = funclib.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), WNet_name=WNet_name, smooth_loss=d['smooth_loss'] , blob_loss=d['blob_loss'], epoch=epoch,  device=device, train_enc_sup=False, freeze_dec=False, target_pos=target_pos, weights=d['weights'])
+    n_cut_losses_avg.append(torch.mean(torch.FloatTensor(enc_losses)))
+    rec_losses_avg.append(torch.mean(torch.FloatTensor(rec_losses)))
 
 # Save model 
 torch.save(model.state_dict(), f'{outdir}/{WNet_name}.pth')
