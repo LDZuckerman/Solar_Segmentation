@@ -451,7 +451,7 @@ class multiclass_MSE_loss(nn.Module):
 def gradient_regularization(softmax):
     '''
     From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
-    ''''
+    '''
     # Expects channels dim before batch dime?
     vertical_sobel=torch.nn.Parameter(torch.from_numpy(np.array([[[[1,  0,  -1], 
                                                                    [1,  0,  -1], 
