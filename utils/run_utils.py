@@ -64,7 +64,7 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
 
     return model, enc_loss, rec_loss, example_seg, example_rec, example_rec2
 
-def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_name, smooth_loss, blob_loss, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None):
+def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_id, smooth_loss, blob_loss, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None):
     '''
     Train WNet for one epoch
     '''
@@ -118,7 +118,7 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_name, smooth_loss,
     for i in range(len(example_segs)):
         for j in range(cols):
             axs[i,j].xaxis.set_tick_params(labelbottom=False); axs[i,j].yaxis.set_tick_params(labelleft=False); axs[i,j].set_xticks([]); axs[i,j].set_yticks([])
-    plt.savefig(f'../NN_storage/{WNet_name}_epoch{epoch}_examples'); plt.close()
+    plt.savefig(f'../WNET_runs/exp{WNet_id}/WNet{WNet_id}_epoch{epoch}_examples'); plt.close()
     enc_losses.append(torch.mean(torch.FloatTensor(enc_losses)))
     rec_losses.append(torch.mean(torch.FloatTensor(rec_losses)))
 
