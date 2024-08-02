@@ -1,15 +1,28 @@
 #!/bin/bash
-
-#SBATCH --nodes=1          
-#SBATCH --ntasks=3          
-#SBATCH --time=08:00:00
-#SBATCH --partition=aa100   # default amilan doesn't have GPU? Using high-mem 'amem' gives sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)
-#SBATCH --gres=gpu:2        # add this when using parition with GPU
+   
+#SBATCH --account=ucb520_asc1 # To use additional resources
+#SBATCH --time=24:00:00
 #SBATCH --output=../Jobs/Job-%j.out
+#SBATCH --nodes=1           # number of nodes to request  
+#SBATCH --mem=80G   #160G          # memory to request
+#SBATCH --partition=amilan  # amilan for cpu, aa100 for gpu
+##SBATCH --gres=gpu:1       # num GPU to request
+gpu=False
 
-module purge
-module load anaconda
-conda activate myenv
+module load anaconda/2020.11
+conda activate torchenv
 
-cd /projects/lezu7058/solar_ML/Solar_Segmentation/
-python run_WNET.py
+cd Solar_Segmentation/
+
+while getopts "f:" flag; do
+ case $flag in
+   f) expfile=$OPTARG;;
+ esac
+done
+
+echo "Running experiment with expfile $expfile"
+python run_WNet.py -gpu $gpu -f $expfile
+
+#####
+# run from ../ with 'sbatch Solar_Segmentation/run_WNet.sh -f exp_file.json'
+######

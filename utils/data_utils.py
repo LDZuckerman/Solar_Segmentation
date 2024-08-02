@@ -30,9 +30,9 @@ class MyDataset(Dataset):
         self.norm = norm
         self.channels = channels
         self.n_classes = n_classes
-        self.randomSharp = randomSharp
+        self.randomSharp = eval(str(randomSharp))
         self.im_size = im_size
-        self.transform = transforms.Resize(im_size)
+        self.resize = transforms.Resize(im_size, antialias=None)
         self.no_first = no_first
 
     def __len__(self):
@@ -42,7 +42,7 @@ class MyDataset(Dataset):
         # Get image
         img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image (or SET of [20, npix, npix] if timeseries)
         img = np.load(img_path)
-        if np.max(img > 1):
+        if np.max(img) > 1:
             raise ValueError('This image does not appear to come from a pre-normalized set')
         if img.dtype.byteorder == '>':
             img = img.newbyteorder().byteswap() 
@@ -51,10 +51,13 @@ class MyDataset(Dataset):
             img = torch.from_numpy(np.expand_dims(img, axis=0)) # transforms expect a batch dimension
             n = stats.halfnorm.rvs(loc=1, scale=1, size=1)[0]
             s = n if np.random.rand(1)[0] < 0.5 else 1/n
-            transf = transforms.RandomAdjustSharpness(sharpness_factor=s, p=0.5)
+            try: 
+                transf = transforms.RandomAdjustSharpness(sharpness_factor=s, p=0.5, antialias=None)
+            except Exception: # If running with older torch version
+                transf = transforms.RandomAdjustSharpness(sharpness_factor=s, p=0.5)
             img = transf(img)[0] # remove batch dimension for now
         if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
-            img = np.array(self.transform(torch.from_numpy(np.expand_dims(img, axis=0)))).squeeze()
+            img = np.array(self.resize(torch.from_numpy(np.expand_dims(img, axis=0)))).squeeze()
         if self.channels != ['X']: # Add feature layers
             if self.channels[0].startswith('timeseries'):
                 tag = self.channels[0][self.channels[0].find('ies')+3:]
@@ -63,14 +66,14 @@ class MyDataset(Dataset):
                 image = np.zeros((len(self.channels), img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
                 image[0, :, :] = img
                 for i in range(1, len(self.channels)):
-                    image[i, :, :] = get_feature(img, self.channels[i], index, self.images[index], self.set, img_path, self.transform)
+                    image[i, :, :] = get_feature(img, self.channels[i], index, self.images[index], img_path, self.resize, self.set)
         else: # Add dummy axis
             image = np.zeros((1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
             image[0, :, :] = img
         if self.no_first:
             image = image[1:, :, :]
         # Get labels
-        mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image
+        mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image (use name, not idx, for safety)
         labels = np.load(mask_path).newbyteorder().byteswap() 
         if self.n_classes==4: # One-hot encode targets so they are the correct size
             mask = np.zeros((4, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
@@ -100,7 +103,7 @@ class MyDataset(Dataset):
             mask[0, :, :] = mask_ig
             mask[1, :, :] = mask_gr
         if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 4 times, for WNet
-            mask = np.array(self.transform(torch.from_numpy(mask)))
+            mask = np.array(self.resize(torch.from_numpy(mask)))
 
         return image, mask
 
@@ -113,6 +116,7 @@ def fill_timeseries(img, tag):
     '''
     Create a timeseries of images around the target image.
     '''
+
     if tag == '20_5':
         image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
@@ -120,14 +124,14 @@ def fill_timeseries(img, tag):
         image[2, :, :] = img[10, :, :] # target image (is it important to put this here?)
         image[3, :, :] = img[15, :, :]
         image[4, :, :] = img[19, :, :] # should've probabaly done sets of 21.. oh well
-    if tag == '40_5':
+    elif tag == '40_5':
         image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
         image[1, :, :] = img[10, :, :]
         image[2, :, :] = img[20, :, :] # target image (is it important to put this here?)
         image[3, :, :] = img[30, :, :]
         image[4, :, :] = img[40, :, :] # these sets are 41
-    if tag == '40_9':
+    elif tag == '40_9':
         image = np.zeros((9, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
         image[1, :, :] = img[5, :, :]
@@ -138,9 +142,12 @@ def fill_timeseries(img, tag):
         image[6, :, :] = img[30, :, :]
         image[7, :, :] = img[35, :, :] 
         image[8, :, :] = img[40, :, :] # these sets are 41
+    else: 
+        raise ValueError(f'Timeseries tag {tag} not recognized')
+    
     return image
 
-def get_feature(img, name, index, image_name, set, imgpath, transform):
+def get_feature(img, name, index, image_name, imgpath, resize, set=None):
     '''
     Add desired feature layers to the image.
     '''
@@ -150,31 +157,33 @@ def get_feature(img, name, index, image_name, set, imgpath, transform):
     elif 'power' in name:
         n = int(name[-1])
         a = img**n
-    elif name == 'binary_residual':
-        im_scaled = (img-np.min(img))/(np.max(img)-np.min(img))
-        if set == 'train':
-            if os.path.exists(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'): # if already save
-                wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'))
-            else: 
-                model = MyWNet(squeeze=2, ch_mul=64, in_chans=2, out_chans=2)
-                model.load_state_dict(torch.load(f'../NN_storage/WNet8m.pth'))
-                x = np.zeros((1, 2, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
-                x[0, 0, :, :] = img
-                x[0, 1, :, :] = img**2
-                X = torch.from_numpy(x) # transforms.Resize(128)(torch.from_numpy(x))
-                probs = model(X, returns='enc') # defualt is to return dec, but we want seg
-                wnet8_preds = np.argmax(probs.detach().numpy(), axis=1).astype(float).squeeze() # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
-                np.save(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_train/wnet8seg_{index}', wnet8_preds)
-        if set == 'val':
-            wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/pred_{index}.npy'))
-        kernel = np.ones((30,30))/900
-        wnet8_preds_smooth = cv2.filter2D(wnet8_preds, -1, kernel)
-        a = (wnet8_preds_smooth - im_scaled)**2 
     elif name == 'Bz':
         mag_path = f'../Data/UNetData_MURaM/mag_images/{set}/{image_name}' # path to one mag image 
         mag = np.load(mag_path).newbyteorder().byteswap()
+        if mag.shape != img.shape: # if img_size != None above, so cut img to desired size, need to do that for mag
+            mag = np.array(resize(torch.from_numpy(np.expand_dims(mag, axis=0)))).squeeze()
         mag = mag**2
-        a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal dist
+        a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal 
+    # elif name == 'binary_residual':
+    #     im_scaled = (img-np.min(img))/(np.max(img)-np.min(img))
+    #     if set == 'train':
+    #         if os.path.exists(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'): # if already save
+    #             wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_{index}'))
+    #         else: 
+    #             model = MyWNet(squeeze=2, ch_mul=64, in_chans=2, out_chans=2)
+    #             model.load_state_dict(torch.load(f'../NN_storage/WNet8m.pth'))
+    #             x = np.zeros((1, 2, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+    #             x[0, 0, :, :] = img
+    #             x[0, 1, :, :] = img**2
+    #             X = torch.from_numpy(x) # transforms.Resize(128)(torch.from_numpy(x))
+    #             probs = model(X, returns='enc') # defualt is to return dec, but we want seg
+    #             wnet8_preds = np.argmax(probs.detach().numpy(), axis=1).astype(float).squeeze() # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+    #             np.save(f'../NN_outputs/WNet8m_outputs/predict_on_train/wnet8seg_train/wnet8seg_{index}', wnet8_preds)
+    #     if set == 'test':
+    #         wnet8_preds = np.squeeze(np.load(f'../NN_outputs/WNet8m_outputs/pred_{index}.npy'))
+    #     kernel = np.ones((30,30))/900
+    #     wnet8_preds_smooth = cv2.filter2D(wnet8_preds, -1, kernel)
+    #     a = (wnet8_preds_smooth - im_scaled)**2 
     elif name == 'median_residual':
         meddir = f'{imgpath[0:imgpath.find("norm_images/")]}med8_images/{set}/'
         if os.path.exists(meddir):
@@ -184,7 +193,7 @@ def get_feature(img, name, index, image_name, set, imgpath, transform):
                 med = np.array(transform(torch.from_numpy(np.expand_dims(med, axis=0)))).squeeze()
             a = img - med
         else: 
-            if set == 'val':
+            if set == 'val': # didint save for test set - instead just compute here
                 s = 8
                 a = img - sndi.median_filter(img, size=s)
             else:

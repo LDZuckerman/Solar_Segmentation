@@ -7,13 +7,15 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+import pandas as pd
+import json
 
 
 ##############################################################
 # Training and evaluation for WNet (can also be used w/ FrNet)
 ##############################################################
 
-def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_loss, psi=0.5, device='cpu', train_enc_sup=False, labels=None, freeze_dec=False, target_pos=0, weights=None):
+def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_loss, smooth_wght=10, ncut_wght=10, blob_wght=1e-1, psi=0.5, device='cpu', train_enc_sup=False, labels=None, freeze_dec=False, target_pos=0, weights=None, debug=False, epoch=np.NaN):
     '''
     Train WNet on one batch of data
     '''
@@ -22,18 +24,25 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
     input = input.to(device) 
 
     enc = model(input, returns='enc') # predict seg of k="squeeze" classes 
-    if train_enc_sup: # if running supervised (FrNet)
+    if eval(str(train_enc_sup)): # if running supervised (FrNet)
         bp_weight = 5 # dm_weight = 4
         loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([1,1,bp_weight]))
         enc_loss = loss_fn(enc, labels)
     else:
-        smooth_wght = 10 if k > 2 else 10 
-        n_cut_loss = soft_n_cut_loss(input,  softmax(enc),  img_size) # from reproduction
-        if (smooth_loss and not blob_loss):
-            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + 10*n_cut_loss # lets try a bigger weight to the smooth loss (11/8) (was 1e-1 I think)
-        if (smooth_loss and blob_loss):
-            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + 10*n_cut_loss + 1e-1*blobloss(enc)
+        n_cut_loss = soft_n_cut_loss(input, softmax(enc),  img_size, debug) 
+        if (eval(str(smooth_loss)) and not eval(str(blob_loss))):
+            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss 
+        elif (eval(str(smooth_loss)) and eval(str(blob_loss))): # Why does this not seem to be doing anything now? 
+            # print(f'Using blob_loss with weight {blob_wght}')
+            # print(f'Loss terms')
+            # print(f'  ncut: {ncut_wght}*{n_cut_loss}={ncut_wght*n_cut_loss}')
+            # print(f'  smooth: {smooth_wght}*{smoothLoss(softmax(enc))}={smooth_wght*smoothLoss(softmax(enc))}')
+            # print(f'  blob: {blob_wght}*{blobloss(enc)}={blob_wght*blobloss(enc)}')
+            # if epoch == 2: a=b
+            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss + blob_wght*blobloss(enc)
         else:
+            print(f'smooth_loss: {smooth_loss} {type(smooth_loss)}, {eval(str(smooth_loss))}')
+            raise ValueError('WARNING: Not using smooth loss. Is this intentional?')
             enc_loss = n_cut_loss
     if torch.isnan(enc_loss).any() == True: 
         fig, axs = plt.subplots(1,3)
@@ -44,9 +53,11 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
     enc_loss.backward()
     optimizer.step()
     optimizer.zero_grad()
+    if enc.shape[1] != k: 
+        raise ValueError(f'Number of classes k  is {k} but enc has shape {enc.shape}')
     example_seg = np.argmax(enc[-1,:,:,:].detach().numpy(), axis=0) # seg for last img in batch
 
-    if freeze_dec:
+    if eval(str(freeze_dec)):
         rec_loss = torch.tensor(np.NaN)
         example_rec = np.zeros_like(example_seg)*np.NaN
         example_rec2 = None
@@ -64,7 +75,7 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
 
     return model, enc_loss, rec_loss, example_seg, example_rec, example_rec2
 
-def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_id, smooth_loss, blob_loss, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None):
+def train_WNet(dataloader, wnet, optimizer, k, img_size, exp_outdir, WNet_id, smooth_loss, blob_loss, smooth_wght, blob_wght, ncut_wght, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None, debug=False, save_examples=True):
     '''
     Train WNet for one epoch
     '''
@@ -78,10 +89,10 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_id, smooth_loss, b
 
     # Train on each batch in train loader
     for (idx, batch) in enumerate(dataloader):
-        print(f'\t   batch {idx}', end='\r')
+        print(f'\t   batch {idx}', end='\r', flush=True)
         X = batch[0] # batch is [images, labels]
         y = batch[1] # only used if train_enc_sup = True
-        wnet, enc_loss, rec_loss, example_seg, example_rec, example_rec2, = train_op(wnet, optimizer, X, k, img_size, smooth_loss=smooth_loss, blob_loss=blob_loss, batch_num=idx, device=device, train_enc_sup=train_enc_sup, labels=y, freeze_dec=freeze_dec, target_pos=target_pos, weights=weights)
+        wnet, enc_loss, rec_loss, example_seg, example_rec, example_rec2, = train_op(wnet, optimizer, X, k, img_size, smooth_loss=smooth_loss, blob_loss=blob_loss, smooth_wght=smooth_wght, ncut_wght=ncut_wght, blob_wght=blob_wght, batch_num=idx, device=device, train_enc_sup=train_enc_sup, labels=y, freeze_dec=freeze_dec, target_pos=target_pos, weights=weights, debug=debug, epoch=epoch)
         enc_losses.append(enc_loss.detach())
         rec_losses.append(rec_loss.detach())
         example_segs.append(example_seg)
@@ -91,34 +102,41 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_id, smooth_loss, b
             example_rec2s.append(example_rec2)
             example_img2s.append(X[-1,1,:,:])
 
-    # Plot example imgs from each batch 
-    cols = 3 if len(example_img2s) == 0 else 5 # if I've stored second rec and image channels
-    fig, axs = plt.subplots(len(example_segs), cols, figsize=(cols*3, len(example_segs)*1.5))
-    axs[0, 0].set_title('last img, target ch')
-    if cols == 3:
-        axs[0, 1].set_title('seg (argmax enc)')
-        axs[0, 2].set_title('reconstructed [target ch]')
-        for i in range(len(example_segs)):
-            axs[i,0].set_ylabel(f'Batch {i}')
-            axs[i,0].imshow(example_imgs[i], vmin=0, vmax=1) #(X[-1,i,:,:])
-            axs[i,1].imshow(example_segs[i])
-            axs[i,2].imshow(example_recs[i])
-    if cols == 5: 
-        axs[0, 1].set_title('last img, 2nd ch')
-        axs[0, 2].set_title('seg (argmax enc)')
-        axs[0, 3].set_title('rec, target ch')
-        axs[0, 4].set_title('rec, 2nd ch')
-        for i in range(len(example_segs)):
-            axs[i,0].set_ylabel(f'Batch {i}')
-            axs[i,0].imshow(example_imgs[i], vmin=0, vmax=1) #(X[-1,i,:,:])
-            axs[i,1].imshow(example_img2s[i], vmin=0, vmax=1)
-            axs[i,2].imshow(example_segs[i])
-            axs[i,3].imshow(example_recs[i])
-            axs[i,4].imshow(example_rec2s[i])
-    for i in range(len(example_segs)):
-        for j in range(cols):
-            axs[i,j].xaxis.set_tick_params(labelbottom=False); axs[i,j].yaxis.set_tick_params(labelleft=False); axs[i,j].set_xticks([]); axs[i,j].set_yticks([])
-    plt.savefig(f'../WNET_runs/exp{WNet_id}/WNet{WNet_id}_epoch{epoch}_examples'); plt.close()
+    # Plot example imgs from each 10 random batches
+    if save_examples:
+        cols = 3 if len(example_img2s) == 0 else 5 # if I've stored second rec and image channels
+        idxs = np.random.choice(np.linspace(0, len(example_segs)-1, len(example_segs)-1, dtype='int'), size=10)
+        fig, axs = plt.subplots(10, cols, figsize=(cols*3, 10)) #plt.subplots(len(example_segs), cols, figsize=(cols*3, len(example_segs)))
+        axs[0, 0].set_title('last img, targ ch')                     
+        if cols == 3: # e.g. for TS or X alone, where only plotting one input channel
+            axs[0, 1].set_title('seg (argmax enc)')
+            axs[0, 2].set_title('rec, targ ch')
+            for i in range(len(idxs)):
+                idx =  idxs[i]   
+                axs[i,0].set_ylabel(f'Batch {idx}')
+                axs[i,0].imshow(example_imgs[idx], vmin=0, vmax=1) #(X[-1,i,:,:])
+                axs[i,1].imshow(example_segs[idx])
+                axs[i,2].imshow(example_recs[idx])
+        if cols == 5: 
+            axs[0, 1].set_title('last img, 2nd ch')
+            axs[0, 2].set_title('seg (argmax enc)')
+            axs[0, 3].set_title('rec, targ ch')
+            axs[0, 4].set_title('rec, 2nd ch')
+            for i in range(len(idxs)):
+                idx =  idxs[i]  
+                axs[i,0].set_ylabel(f'Batch {idx}')
+                axs[i,0].imshow(example_imgs[idx], vmin=0, vmax=1) #(X[-1,i,:,:])
+                axs[i,1].imshow(example_img2s[idx], vmin=0, vmax=1)
+                axs[i,2].imshow(example_segs[idx])
+                axs[i,3].imshow(example_recs[idx])
+                axs[i,4].imshow(example_rec2s[idx])
+        for i in range(len(idxs)):
+            for j in range(cols):
+                axs[i,j].xaxis.set_tick_params(labelbottom=False); axs[i,j].yaxis.set_tick_params(labelleft=False); axs[i,j].set_xticks([]); axs[i,j].set_yticks([])
+        plt.tight_layout()
+        plt.savefig(f'{exp_outdir}/WNet{WNet_id}_epoch{epoch}_examples'); plt.close()
+
+    # Add losses to loss lists
     enc_losses.append(torch.mean(torch.FloatTensor(enc_losses)))
     rec_losses.append(torch.mean(torch.FloatTensor(rec_losses)))
 
@@ -126,10 +144,10 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, WNet_id, smooth_loss, b
 
 def save_WNET_results(val_loader, save_dir, model, target_pos=0):
     '''
-    Run each validation obs through model, save results
+    Run each vtest obs through model, save results
     True and predicted vals are saved as 2d maps; e.g. compressed back to original seg format
     '''
-    print(f'Loading model back in, saving results on validation data in {save_dir}')
+    print(f'Loading model back in, saving results on test data in {save_dir}')
     if os.path.exists(save_dir) == False: os.mkdir(save_dir)
     i = 0
     for X, y in val_loader:
@@ -137,7 +155,7 @@ def save_WNET_results(val_loader, save_dir, model, target_pos=0):
         X, y = X.to('cpu'), y.to('cpu')
         probs = model(X, returns='enc') # defualt is to return dec, but we want seg
         preds = np.argmax(probs.detach().numpy(), axis=1).astype(float) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
-        y = np.argmax(y.detach().numpy(), axis=1).astype(np.float) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
+        y = np.argmax(y.detach().numpy(), axis=1).astype(float) # turn 1-hot-encoded layers [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
         if probs.shape[1] == 3: # if 3 classs (predictions have 4 layers)
             preds[preds == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
             y[y == 2] = 1.5 # change from idx to class value 0 -> 0 (IG), 1 -> 1 (G), 2 -> 1.5 (BP)
@@ -149,7 +167,6 @@ def save_WNET_results(val_loader, save_dir, model, target_pos=0):
             np.save(f'{save_dir}/true_{i}', np.array(y[j]))
             np.save(f'{save_dir}/pred_{i}', np.array(preds[j]))
             i += 1
-
 
 ##############################
 # UNet training and evaluation
@@ -335,18 +352,35 @@ def blobloss(outputs):
     return loss
 
 
-def soft_n_cut_loss(image, enc, img_size):
+def soft_n_cut_loss(image, enc, img_size, debug):
     '''
     From https://github.com/AsWali/WNet/blob/master/utils
     '''
-    loss = []
-    batch_size = image.shape[0]
-    k = enc.shape[1]
-    weights = calculate_weights(image, batch_size, img_size)
+    try: 
+        if debug: print(f'\t  inside soft_n_cut_loss', flush=True)
+        loss = []
+        batch_size = image.shape[0]
+        k = enc.shape[1]
+        weights = calculate_weights(image, batch_size, img_size)
+    except Exception as e:
+        print('error above')
+        print(e)
+    if debug: print(f'\t  k {k}', flush=True)
     for i in range(0, k):
-        loss.append(soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size))
+        try:
+            l = soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size, debug=debug)
+            if debug: print(f'\t    i {i}, computed l', flush=True)
+            loss.append(l) # GETS STUCK HERE WHEN RUN ON ALPINE? 
+        except Exception as e:
+            print('error in soft_n_cut_loss for i = {i}')
+            print(e)
+    if debug: print(f'\t  losses appended to loss', flush=True)
     da = torch.stack(loss)
-    return torch.mean(k - torch.sum(da, dim=0))
+    if debug: print(f'\t  computed da', flush=True)
+    out = torch.mean(k - torch.sum(da, dim=0))
+    if debug: print(f'\t  computed out', flush=True)
+
+    return out
 
 
 def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=10):
@@ -378,10 +412,11 @@ def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=1
     return torch.mul(patches, distance_weights)
 
 
-def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5):
+def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5, debug=False):
     '''
     From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
     '''
+
     channels = 1
     h, w = img_size
     p = radius
@@ -395,7 +430,9 @@ def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5):
     nom = weights * seg
     nominator = torch.sum(enc * torch.sum(nom, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
     denominator = torch.sum(enc * torch.sum(weights, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
-    return torch.div(nominator, denominator)
+    out = torch.div(nominator, denominator)
+
+    return out
 
 
 class multiclass_MSE_loss(nn.Module):
@@ -500,6 +537,9 @@ class OpeningLoss2D(nn.Module):
 
         return nn.MSELoss()(labels, smooth_labels.detach())
 
+########################################
+# Helper functions for evaluating models
+########################################
 
 def onehot_to_map(y):
     '''
@@ -527,3 +567,35 @@ def probs_to_preds(probs):
         preds = np.argmax(probs.detach().numpy(), axis=1) # turn probabilities [n_obs, n_class, n_pix, n_pix] into predicted class labels [n_obs, n_pix, n_pix]
 
     return preds
+
+def get_modelsDF(taskdir='../WNet_runs', tag='nm'):
+    '''
+    Helper function to create dataframe of all run models and thier parameters
+    '''
+    expdirs = [f for f in os.listdir(taskdir) if os.path.isdir(f'{taskdir}/{f}') and tag in f]
+    
+    # Create DF from exp dicts
+    all_info = []
+    for expdir in expdirs:
+        
+        # Skip if not finished training 
+        if not os.path.exists(f'{taskdir}/{expdir}/test_preds_MURaM'):
+            print(f'Skipping {expdir}; not finished training')
+            continue
+        if not os.path.exists(f'{taskdir}/{expdir}/exp_file.json'):
+            print(f'Skipping {expdir}; no exp_file found')
+            continue
+        exp_dict = json.load(open(f'{taskdir}/{expdir}/exp_file.json','rb'))
+        
+        # Change names for compact display
+        if 'timeseries' in exp_dict['channels'][0]:
+            exp_dict['channels'] = [exp_dict['channels'][0].replace('timeseries', 'TS')] 
+        if len(exp_dict['channels']) == 2 and 'median_residual' in exp_dict['channels'][1]:
+            exp_dict['channels'] = [exp_dict['channels'][0], 'MedRes'] 
+        all_info.append(exp_dict)
+    
+    # Drop cols and sort 
+    all_info = pd.DataFrame(all_info).drop(columns=['img_dir', 'seg_dir', 'img_size', 'num_sup', 'freeze_dec', 'batch_size', 'weights','randomSharp'])
+    all_info = all_info.sort_values(by='WNet_name')
+    
+    return all_info 
