@@ -20,7 +20,7 @@ def run_wnet_model(d, gpu, test_only=False):
             outdir='../'+outdir; imgdir = '../'+imgdir; segdir = '../'+segdir
         except: 
             raise Exception(f'Image directory {imgdir} does not exist.')
-    exp_outdir = f'{outdir}/exp{WNet_id}/'
+    exp_outdir = f'{outdir}/{d["task_dir"]}/{WNet_name}/'
     
     # Copy exp dict file for convenient future reference and create exp outdir 
     if not os.path.exists(exp_outdir): 
@@ -45,7 +45,7 @@ def run_wnet_model(d, gpu, test_only=False):
     
     # Define model
     device = torch.device('cuda') if eval(str(gpu)) else torch.device('cpu') #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = models.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['padding_mode']).to(device)
+    model = models.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, kernel_size=d['kernel_size'], padding_mode=d['padding_mode']).to(device)
     
     # Create outdir and train 
     if not eval(str(test_only)):
@@ -58,15 +58,15 @@ def run_wnet_model(d, gpu, test_only=False):
         for epoch in range(d['num_epochs']):
             print(f'Epoch {epoch}', flush=True)
             save_examples = True if d['num_epochs'] < 4 or epoch % 2 == 0 or epoch == d['num_epochs']-1 or epoch == d['num_epochs']-2 else False # if more than 5 epochs, save imgs for only every other epoch, 2nd to last, and last epoch 
-            enc_losses, rec_losses = run_utils.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, WNet_id=WNet_id, smooth_loss=d['smooth_loss'], blob_loss=d['blob_loss'], smooth_wght=d['smooth_wght'], blob_wght=d['blob_wght'], ncut_wght=d['ncut_wght'], epoch=epoch,  device=device, train_enc_sup=False, freeze_dec=False, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
+            enc_losses, rec_losses = run_utils.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, WNet_id=WNet_id, smooth_wght=d['smooth_wght'], blob_wght=d['blob_wght'], ncut_wght=d['ncut_wght'], epoch=epoch,  device=device, train_enc_sup=False, freeze_dec=False, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
             n_cut_losses_avg.append(torch.mean(torch.FloatTensor(enc_losses)))
             rec_losses_avg.append(torch.mean(torch.FloatTensor(rec_losses)))
 
         # Save model 
         torch.save(model.state_dict(), f'{exp_outdir}/{WNet_name}.pth')
         print(f'Saving trained model as {exp_outdir}/{WNet_name}.pth, and saving average losses', flush=True)
-        np.save(f'{exp_outdir}/{WNet_name}_n_cut_losses', n_cut_losses_avg)
-        np.save(f'{exp_outdir}/{WNet_name}_rec_losses', rec_losses_avg)
+        np.save(f'{exp_outdir}/n_cut_losses', n_cut_losses_avg)
+        np.save(f'{exp_outdir}/rec_losses', rec_losses_avg)
 
     # Load it back in and save results on test data 
     model = models.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['padding_mode'])
