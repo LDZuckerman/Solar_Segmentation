@@ -1,0 +1,13 @@
+{"WNet_name": "magNetX", 
+ "task_dir":"MURaM",
+ "n_classes": 3, 
+ "channels": ["X"], 
+ "weights": [1], 
+ "img_dir": "../Data/UNetData_MURaM/norm_images/", 
+ "true_dir": "../Data/UNetData_MURaM/mag_images/", 
+ "img_size": 128,
+ "randomSharp": "False", 
+ "loss_func": ""
+ "num_epochs": 5, 
+ "batch_size": 16, 
+ "learning_rate": 0.001}
