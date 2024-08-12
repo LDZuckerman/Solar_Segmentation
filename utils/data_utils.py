@@ -22,7 +22,7 @@ class MyDataset(Dataset):
     '''
     Dataset class for loading images and labels from a directory.
     '''
-    def __init__(self, image_dir, mask_dir, set, norm=False, channels=['X'], n_classes=2, randomSharp=False, im_size=None, no_first=False):
+    def __init__(self, image_dir, mask_dir, set, norm=False, channels=['X'], n_classes=2, randomSharp=False, im_size=None):
         self.image_dir = f'{image_dir}{set}'
         self.mask_dir = f'{mask_dir}{set}'
         self.set = set
@@ -33,7 +33,6 @@ class MyDataset(Dataset):
         self.randomSharp = eval(str(randomSharp))
         self.im_size = im_size
         self.resize = transforms.Resize(im_size, antialias=None)
-        self.no_first = no_first
 
     def __len__(self):
         return len(self.images)
@@ -70,8 +69,6 @@ class MyDataset(Dataset):
         else: # Add dummy axis
             image = np.zeros((1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
             image[0, :, :] = img
-        if self.no_first:
-            image = image[1:, :, :]
         # Get labels
         mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image (use name, not idx, for safety)
         labels = np.load(mask_path).newbyteorder().byteswap() 
@@ -131,6 +128,13 @@ def fill_timeseries(img, tag):
         image[2, :, :] = img[20, :, :] # target image (is it important to put this here?)
         image[3, :, :] = img[30, :, :]
         image[4, :, :] = img[40, :, :] # these sets are 41
+    elif tag == '80_5':
+        image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
+        image[0, :, :] = img[0, :, :]
+        image[1, :, :] = img[20, :, :]
+        image[2, :, :] = img[40, :, :] # target image (is it important to put this here?)
+        image[3, :, :] = img[60, :, :]
+        image[4, :, :] = img[80, :, :] # these sets are 81
     elif tag == '40_9':
         image = np.zeros((9, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
@@ -154,7 +158,7 @@ def get_feature(img, name, index, image_name, imgpath, resize, set=None):
     if name == 'gradx': a = np.gradient(img)[0]
     elif name == 'grady': a = np.gradient(img)[1]
     elif name == 'smoothed': a = scipy.ndimage.gaussian_filter(img, sigma=3)
-    elif 'power' in name:
+    elif '**' in name:
         n = int(name[-1])
         a = img**n
     elif name == 'Bz':
