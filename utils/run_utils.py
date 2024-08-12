@@ -9,13 +9,13 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import pandas as pd
 import json
-
+import loss_funcs
 
 ##############################################################
 # Training and evaluation for WNet (can also be used w/ FrNet)
 ##############################################################
 
-def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_loss, smooth_wght=10, ncut_wght=10, blob_wght=1e-1, psi=0.5, device='cpu', train_enc_sup=False, labels=None, freeze_dec=False, target_pos=0, weights=None, debug=False, epoch=np.NaN):
+def train_wnet_batch(model, optimizer, input, k, img_size, smooth_wght=10, ncut_wght=10, blob_wght=1e-1, psi=0.5, device='cpu', train_enc_sup=False, labels=None, freeze_dec=False, target_pos=0, weights=None, debug=False, epoch=np.NaN):
     '''
     Train WNet on one batch of data
     '''
@@ -30,20 +30,26 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
         enc_loss = loss_fn(enc, labels)
     else:
         n_cut_loss = soft_n_cut_loss(input, softmax(enc),  img_size, debug) 
-        if (eval(str(smooth_loss)) and not eval(str(blob_loss))):
-            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss 
-        elif (eval(str(smooth_loss)) and eval(str(blob_loss))): # Why does this not seem to be doing anything now? 
-            # print(f'Using blob_loss with weight {blob_wght}')
-            # print(f'Loss terms')
-            # print(f'  ncut: {ncut_wght}*{n_cut_loss}={ncut_wght*n_cut_loss}')
-            # print(f'  smooth: {smooth_wght}*{smoothLoss(softmax(enc))}={smooth_wght*smoothLoss(softmax(enc))}')
-            # print(f'  blob: {blob_wght}*{blobloss(enc)}={blob_wght*blobloss(enc)}')
-            # if epoch == 2: a=b
-            enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss + blob_wght*blobloss(enc)
-        else:
-            print(f'smooth_loss: {smooth_loss} {type(smooth_loss)}, {eval(str(smooth_loss))}')
-            raise ValueError('WARNING: Not using smooth loss. Is this intentional?')
-            enc_loss = n_cut_loss
+        if smooth_wght == 0: raise ValueError('WARNING: Not using smooth loss. Is this intentional?')
+        # if (eval(str(smooth_loss)) and not eval(str(blob_loss))): # (8/6) REMOVE BOOLEEN LOSS TERM FLAGS - JUST WEIGHT AS 0
+        #     enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss 
+        # elif (eval(str(smooth_loss)) and eval(str(blob_loss))): # Why does this not seem to be doing anything now? 
+        #     # print(f'Using blob_loss with weight {blob_wght}')
+        #     # print(f'Loss terms')
+        #     # print(f'  ncut: {ncut_wght}*{n_cut_loss}={ncut_wght*n_cut_loss}')
+        #     # print(f'  smooth: {smooth_wght}*{smoothLoss(softmax(enc))}={smooth_wght*smoothLoss(softmax(enc))}')
+        #     # print(f'  blob: {blob_wght}*{blobloss(enc)}={blob_wght*blobloss(enc)}')
+        #     # if epoch == 2: a=b
+        #     enc_loss = smooth_wght*smoothLoss(softmax(enc)) + ncut_wght*n_cut_loss + blob_wght*blobloss(enc)
+        # else:
+        #     print(f'smooth_loss: {smooth_loss} {type(smooth_loss)}, {eval(str(smooth_loss))}')
+        #     raise ValueError('WARNING: Not using smooth loss. Is this intentional?')
+        #     enc_loss = n_cut_loss 
+        enc_loss = ncut_wght*n_cut_loss
+        if blob_wght != 0:
+            enc_loss +=  blob_wght*blobloss(enc) 
+        if smooth_wght != 0:
+            enc_loss += smooth_wght*smoothLoss(softmax(enc))
     if torch.isnan(enc_loss).any() == True: 
         fig, axs = plt.subplots(1,3)
         axs[0].imshow(input[-1,target_pos,:,:]) # last img in batch, first channel
@@ -54,7 +60,7 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
     optimizer.step()
     optimizer.zero_grad()
     if enc.shape[1] != k: 
-        raise ValueError(f'Number of classes k  is {k} but enc has shape {enc.shape}')
+        raise ValueError(f'Number of classes k is {k} but enc has shape {enc.shape}')
     example_seg = np.argmax(enc[-1,:,:,:].detach().numpy(), axis=0) # seg for last img in batch
 
     if eval(str(freeze_dec)):
@@ -75,7 +81,7 @@ def train_op(model, optimizer, input, k, img_size, batch_num, smooth_loss, blob_
 
     return model, enc_loss, rec_loss, example_seg, example_rec, example_rec2
 
-def train_WNet(dataloader, wnet, optimizer, k, img_size, exp_outdir, WNet_id, smooth_loss, blob_loss, smooth_wght, blob_wght, ncut_wght, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None, debug=False, save_examples=True):
+def train_WNet(dataloader, wnet, optimizer, k, img_size, exp_outdir, WNet_id, smooth_wght, blob_wght, ncut_wght, epoch, device='cpu', train_enc_sup=False, freeze_dec=False, target_pos=0, weights=None, debug=False, save_examples=True):
     '''
     Train WNet for one epoch
     '''
@@ -92,7 +98,7 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, exp_outdir, WNet_id, sm
         print(f'\t   batch {idx}', end='\r', flush=True)
         X = batch[0] # batch is [images, labels]
         y = batch[1] # only used if train_enc_sup = True
-        wnet, enc_loss, rec_loss, example_seg, example_rec, example_rec2, = train_op(wnet, optimizer, X, k, img_size, smooth_loss=smooth_loss, blob_loss=blob_loss, smooth_wght=smooth_wght, ncut_wght=ncut_wght, blob_wght=blob_wght, batch_num=idx, device=device, train_enc_sup=train_enc_sup, labels=y, freeze_dec=freeze_dec, target_pos=target_pos, weights=weights, debug=debug, epoch=epoch)
+        wnet, enc_loss, rec_loss, example_seg, example_rec, example_rec2, = train_wnet_batch(wnet, optimizer, X, k, img_size=img_size, smooth_wght=smooth_wght, ncut_wght=ncut_wght, blob_wght=blob_wght, device=device, train_enc_sup=train_enc_sup, labels=y, freeze_dec=freeze_dec, target_pos=target_pos, weights=weights, debug=debug, epoch=epoch)
         enc_losses.append(enc_loss.detach())
         rec_losses.append(rec_loss.detach())
         example_segs.append(example_seg)
@@ -134,7 +140,7 @@ def train_WNet(dataloader, wnet, optimizer, k, img_size, exp_outdir, WNet_id, sm
             for j in range(cols):
                 axs[i,j].xaxis.set_tick_params(labelbottom=False); axs[i,j].yaxis.set_tick_params(labelleft=False); axs[i,j].set_xticks([]); axs[i,j].set_yticks([])
         plt.tight_layout()
-        plt.savefig(f'{exp_outdir}/WNet{WNet_id}_epoch{epoch}_examples'); plt.close()
+        plt.savefig(f'{exp_outdir}/epoch{epoch}_examples'); plt.close()
 
     # Add losses to loss lists
     enc_losses.append(torch.mean(torch.FloatTensor(enc_losses)))
@@ -172,7 +178,8 @@ def save_WNET_results(val_loader, save_dir, model, target_pos=0):
 # UNet training and evaluation
 ##############################
 
-def train_UNET(loader, model, optimizer, loss_fn, scaler, dm_weight=1, bp_weight=1, device='cpu'):
+def train_UNET(loader, model, optimizer, loss_func, scaler, dm_weight=1, bp_weight=1, device='cpu'):
+        #train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, UNet_id=UNet_id, epoch=epoch,  device=device, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
     '''
     Train UNet for one epoch
     '''
@@ -186,6 +193,7 @@ def train_UNET(loader, model, optimizer, loss_fn, scaler, dm_weight=1, bp_weight
         targets = targets.float().to(device)
         # forward
         predictions = model(data) 
+        loss_fn = get_loss_func(loss_func)
         if isinstance(loss_fn, multiclass_MSE_loss):
             loss = loss_fn(predictions, targets, dm_weight, bp_weight) # compute loss
         elif isinstance(loss_fn, nn.CrossEntropyLoss):
@@ -318,173 +326,6 @@ def eval_metrics(metric, true, preds):
         return metrics.accuracy_score(true, preds)
 
 
-################
-# Loss functions
-################
-
-def multichannel_MSE_loss(x, x_prime, weights):
-    '''
-    MSE loss but with ability to weight loss from each channel differently
-    For WNet reconstruction loss
-    '''
-
-    loss = 0
-    for channel in range(x.shape[1]):
-        mse = nn.MSELoss()(x[:,channel,:,:], x_prime[:,channel,:,:])
-        loss += weights[channel]*mse
-    loss = loss/(x.shape[1])
-
-    return loss
-
-    
-def blobloss(outputs):
-    '''
-    Metric describing how much the classes group pixels into circular blobs vs long shapes (e.g. outlines of other blobs)
-    '''
-    preds = np.argmax(outputs.detach().numpy(), axis=1) # take argmax along classes axis
-    edge_pix = 0
-    for batch in range(preds.shape[0]):
-        cv2.imwrite("temp_img.png", preds[batch,:,:]) 
-        edges = np.array(cv2.Canny(cv2.imread("temp_img.png"),0,1.5))
-        edge_pix += len(edges[edges > 0])
-    loss = edge_pix/(preds.shape[0]*preds.shape[1]**2)
-
-    return loss
-
-
-def soft_n_cut_loss(image, enc, img_size, debug):
-    '''
-    From https://github.com/AsWali/WNet/blob/master/utils
-    '''
-    try: 
-        if debug: print(f'\t  inside soft_n_cut_loss', flush=True)
-        loss = []
-        batch_size = image.shape[0]
-        k = enc.shape[1]
-        weights = calculate_weights(image, batch_size, img_size)
-    except Exception as e:
-        print('error above')
-        print(e)
-    if debug: print(f'\t  k {k}', flush=True)
-    for i in range(0, k):
-        try:
-            l = soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size, debug=debug)
-            if debug: print(f'\t    i {i}, computed l', flush=True)
-            loss.append(l) # GETS STUCK HERE WHEN RUN ON ALPINE? 
-        except Exception as e:
-            print('error in soft_n_cut_loss for i = {i}')
-            print(e)
-    if debug: print(f'\t  losses appended to loss', flush=True)
-    da = torch.stack(loss)
-    if debug: print(f'\t  computed da', flush=True)
-    out = torch.mean(k - torch.sum(da, dim=0))
-    if debug: print(f'\t  computed out', flush=True)
-
-    return out
-
-
-def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=10):
-    '''
-    From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
-    '''
-    channels = 1
-    image = torch.mean(input, dim=1, keepdim=True)
-    h, w = img_size
-    p = radius
-    image = F.pad(input=image, pad=(p, p, p, p), mode='constant', value=0)
-    kh, kw = radius*2 + 1, radius*2 + 1
-    dh, dw = 1, 1
-    patches = image.unfold(2, kh, dh).unfold(3, kw, dw)
-    patches = patches.contiguous().view(batch_size, channels, -1, kh, kw)
-    patches = patches.permute(0, 2, 1, 3, 4)
-    patches = patches.view(-1, channels, kh, kw)
-    center_values = patches[:, :, radius, radius]
-    center_values = center_values[:, :, None, None]
-    center_values = center_values.expand(-1, -1, kh, kw)
-    k_row = (torch.arange(1, kh + 1) - torch.arange(1, kh + 1)[radius]).expand(kh, kw)
-    if torch.cuda.is_available():
-        k_row = k_row.cuda()
-    distance_weights = (k_row ** 2 + k_row.T**2)
-    mask = distance_weights.le(radius)
-    distance_weights = torch.exp(torch.div(-1*(distance_weights), ox**2))
-    distance_weights = torch.mul(mask, distance_weights)
-    patches = torch.exp(torch.div(-1*((patches - center_values)**2), oi**2))
-    return torch.mul(patches, distance_weights)
-
-
-def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5, debug=False):
-    '''
-    From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
-    '''
-
-    channels = 1
-    h, w = img_size
-    p = radius
-    kh, kw = radius*2 + 1, radius*2 + 1
-    dh, dw = 1, 1
-    encoding = F.pad(input=enc, pad=(p, p, p, p), mode='constant', value=0)
-    seg = encoding.unfold(2, kh, dh).unfold(3, kw, dw)
-    seg = seg.contiguous().view(batch_size, channels, -1, kh, kw)
-    seg = seg.permute(0, 2, 1, 3, 4)
-    seg = seg.view(-1, channels, kh, kw)
-    nom = weights * seg
-    nominator = torch.sum(enc * torch.sum(nom, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
-    denominator = torch.sum(enc * torch.sum(weights, dim=(1,2,3)).reshape(batch_size, h, w), dim=(1,2,3))
-    out = torch.div(nominator, denominator)
-
-    return out
-
-
-class multiclass_MSE_loss(nn.Module):
-    '''
-    DONT USE THIS - IT DOESNT SEEM TO BE WORKING 
-    '''
-
-    def __init__(self):
-        super(multiclass_MSE_loss, self).__init__()
-
-    def forward(self, outputs, targets, dm_weight=1, bp_weight=1):
-        """
-        Compute MSE between preds and targets for each layer (Ig, DM, ..etc). 
-        Sum to get total, applying wieghting to small classes.
-        NOTE: in this blog, they do a similar thing for image classification https://towardsdatascience.com/implementing-custom-loss-functions-in-pytorch-50739f9e0ee1
-        NOTE: should really just generalize this to any num classes
-        
-        Parameters
-        ----------
-        outputs : `numpy.ndarray` of shape [n_obs, n_classes, n_pix, n_pix]
-            Model outputs before application of activation function
-        
-        Returns
-        -------
-        targets : `numpy.ndarray` [n_obs, n_classes, n_pix, n_pix]
-            One-hot encoded target values. Ordering along n_class axis must be the same as for preds.
-        """
-
-        probs = torch.sigmoid(outputs) # use sigmiod to turn into class probs
-        # preds =  probs_to_preds(probs) # JUST ADDED - WILL IT FIX IT?
-        preds = probs
-
-        mse = nn.MSELoss()
-        n_classes = len(targets[0,:,0,0])
-        if n_classes == 3:
-            mse_ig, mse_gr, mse_bp = 0, 0, 0
-            for idx in range(probs.shape[0]): # loop through images in batch
-                mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
-                mse_gr += mse(targets[idx,1,:,:], preds[idx,1,:,:])
-                mse_bp += mse(targets[idx,2,:,:], preds[idx,2,:,:]) * bp_weight
-            loss =  mse_ig + mse_gr + bp_weight*mse_bp
-        if n_classes == 4:
-            mse_ig, mse_dm, mse_gr, mse_bp = 0, 0, 0, 0
-            for idx in range(preds.shape[0]): # loop through images in batch
-                mse_ig += mse(targets[idx,0,:,:], preds[idx,0,:,:])
-                mse_dm += mse(targets[idx,1,:,:], preds[idx,1,:,:]) * dm_weight
-                mse_gr += mse(targets[idx,2,:,:], preds[idx,2,:,:])
-                mse_bp += mse(targets[idx,3,:,:], preds[idx,3,:,:]) * bp_weight
-            loss =  mse_ig + dm_weight*mse_dm + mse_gr + bp_weight*mse_bp
-        return loss
-
-
 def gradient_regularization(softmax):
     '''
     From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
@@ -503,39 +344,18 @@ def gradient_regularization(softmax):
 
     return mean
 
-
-class OpeningLoss2D(nn.Module):
+def get_loss_func(loss_name):
     '''
-    From Benoit's student's project https://github.com/tremblaybenoit/search/blob/main/src_freeze/loss.py 
-    Computes the Mean Squared Error between computed class probabilities their grey opening.  
-    Grey opening is a morphology operation, which performs an erosion followed by dilation.  
-    Encourages the network to return sharper boundaries to objects in the class probabilities.
+    Load loss functions from loss_funcs.py
     '''
 
-    def __init__(self, radius: int = 2):
-        r"""
-        :param radius: Radius for the channel-wise grey opening operation
-        """
-        super(OpeningLoss2D, self).__init__()
-        self.radius = radius
+    loss_func = getattr(loss_funcs, loss_name)
+    try:
+        l=loss_func()
+    except:
+        l=loss_func
 
-    def forward(self, labels: torch.Tensor, *args) -> torch.Tensor:
-        r"""Computes the Opening loss -- i.e. the MSE due to performing a greyscale opening operation.
-
-        :param labels: Predicted class probabilities
-        :param args: Extra inputs, in case user also provides input/output image values.
-        :return: Opening loss
-        """
-        smooth_labels = labels.clone().detach().cpu().numpy()
-        for i in range(labels.shape[0]):
-            for j in range(labels.shape[1]):
-                smooth_labels[i, j] = sndi.grey_opening(smooth_labels[i, j], self.radius)
-
-        smooth_labels = torch.from_numpy(smooth_labels.astype(np.float32))
-        if labels.device.type == 'cuda':
-            smooth_labels = smooth_labels.cuda()
-
-        return nn.MSELoss()(labels, smooth_labels.detach())
+    return l
 
 ########################################
 # Helper functions for evaluating models
@@ -568,7 +388,7 @@ def probs_to_preds(probs):
 
     return preds
 
-def get_modelsDF(taskdir='../WNet_runs', tag='nm'):
+def get_modelsDF(taskdir='../WNet_runs/MURaM', tag=''):
     '''
     Helper function to create dataframe of all run models and thier parameters
     '''
@@ -587,15 +407,27 @@ def get_modelsDF(taskdir='../WNet_runs', tag='nm'):
             continue
         exp_dict = json.load(open(f'{taskdir}/{expdir}/exp_file.json','rb'))
         
-        # Change names for compact display
+        # Add kernel size and task dir for models run before this was added as a changable parameter
+        if 'kernel_size' not in exp_dict.keys():
+            exp_dict['kernel_size'] = 3
+        if 'task_dir' not in exp_dict.keys():
+            exp_dict['task_dir'] = 'MURaM'
+        
+        # Change str values for compact display
         if 'timeseries' in exp_dict['channels'][0]:
             exp_dict['channels'] = [exp_dict['channels'][0].replace('timeseries', 'TS')] 
         if len(exp_dict['channels']) == 2 and 'median_residual' in exp_dict['channels'][1]:
             exp_dict['channels'] = [exp_dict['channels'][0], 'MedRes'] 
+            
+        # Get name form folder, not dict
+        exp_dict['WNet_name'] = expdir
         all_info.append(exp_dict)
     
     # Drop cols and sort 
-    all_info = pd.DataFrame(all_info).drop(columns=['img_dir', 'seg_dir', 'img_size', 'num_sup', 'freeze_dec', 'batch_size', 'weights','randomSharp'])
+    all_info = pd.DataFrame(all_info).drop(columns=['img_dir', 'seg_dir', 'img_size', 'num_sup', 'freeze_dec', 'batch_size', 'randomSharp','smooth_loss','blob_loss'])
     all_info = all_info.sort_values(by='WNet_name')
+
+    # Change col names for compact display
+    all_info = all_info.rename(columns={"smooth_wght":"smth_wgt","blob_wght":"blb_wgt","ncut_wght":"nct_wgt", "padding_mode":"pad_mode","learning_rate":"lr","num_epochs":"ne","kernel_size":"k_size"}) 
     
     return all_info 
