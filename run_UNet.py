@@ -8,31 +8,28 @@ import json
 import os, shutil
 
 '''
-Script to train a UNet model to predict magentic flux images
+Script to train a UNet model
+Currently for magentic flux prediction, although could be used for supervised segmentation
 '''
 
 def run_unet_model(d, gpu, test_only=False):
     
     # Set out and data dirs
     UNet_name = d['UNet_name'] 
-    UNet_id = d['UNet_name'].replace('UNet', '')
-    outdir = f"../magNet_runs"  
+    outdir = f"../model_runs_mag" # create this before running
     imgdir = d['img_dir']
     truedir = d['true_dir'] # mag images
-    if not os.path.exists(imgdir):
-        try: # if running from Solar_Segmentation/analysis/unsupervised.ipynb notebook for debugging
-            outdir='../'+outdir; imgdir = '../'+imgdir; segdir = '../'+segdir
-        except: 
-            raise Exception(f'Image directory {imgdir} does not exist.')
-    exp_outdir = f'{outdir}/exp{UNet_id}/'
+    if not os.path.exists(outdir) and os.path.exists('../'+outdir): # if running from Solar_Segmentation/analysis/unsupervised.ipynb notebook for debugging 
+        outdir='../'+outdir
+    exp_outdir = f'{outdir}/{d["sub_dir"]}/{UNet_name}/'
     
     # Copy exp dict file for convenient future reference and create exp outdir 
     if not os.path.exists(exp_outdir): 
-        print(f'Creating experiment output dir {exp_outdir}')
+        print(f'Creating experiment output dir {os.getcwd()}/{exp_outdir}')
         os.makedirs(exp_outdir)
     elif not test_only:
-        print(f'Experiment output dir {exp_outdir} already exists - contents will be overwritten')
-    print(f'Copying exp dict into {exp_outdir}/exp_file.json')
+        print(f'Experiment output dir {os.getcwd()}/{exp_outdir} already exists - contents will be overwritten')
+    print(f'Copying exp dict into {os.getcwd()}/{exp_outdir}/exp_file.json')
     json.dump(d, open(f'{exp_outdir}/exp_file.json','w'))
     
     # Get data 
@@ -41,39 +38,45 @@ def run_unet_model(d, gpu, test_only=False):
     im_size = 128
     in_channels = int(channels[0][channels[0].find('_')+1:]) if channels[0].startswith('time') else len(channels)
     target_pos = int(np.floor(in_channels/2)) if channels[0].startswith('time') else 0 # position of target within channels axis
-    train_ds = data_utils.MyDataset(image_dir=imgdir, mask_dir=segdir, set='train', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'], 
+    train_ds = data_utils.dataset(image_dir=imgdir, mask_dir=truedir, set='train', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'], 
     train_loader = DataLoader(train_ds, batch_size=d['batch_size'], pin_memory=True, shuffle=True)
-    test_ds = data_utils.MyDataset(image_dir=imgdir, mask_dir=segdir, set='val', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'],
+    test_ds = data_utils.dataset(image_dir=imgdir, mask_dir=truedir, set='val', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'],
     test_loader = DataLoader(test_ds, batch_size=d['batch_size'], pin_memory=True, shuffle=False)
     data_utils.check_inputs(train_ds, train_loader, savefig=False, name=UNet_name)
     
-    # Define model
+    # Define model and loss func optimizer
     device = torch.device('cuda') if eval(str(gpu)) else torch.device('cpu') #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = models.MyUNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, kernel_size=d['kernel_size'], padding_mode=d['padding_mode']).to(device)
+    if 'mag' in UNet_name:
+        model = models.magNet(in_channels=in_channels).to(device)
+    loss_func = run_utils.get_loss_func(d['loss_func']) # [8/12/24] was I re-initializing this each time time I computed loss before???
+    optimizer = torch.optim.SGD(model.parameters(), lr=d["learning_rate"])
     
     # Create outdir and train 
     if not eval(str(test_only)):
 
         # Train model
-        optimizer = torch.optim.SGD(model.parameters(), lr=d["learning_rate"])
         losses = []
         print(f"Training {UNet_name} (training on {device})", flush=True)
         for epoch in range(d['num_epochs']):
             print(f'Epoch {epoch}', flush=True)
             save_examples = True if d['num_epochs'] < 4 or epoch % 2 == 0 or epoch == d['num_epochs']-1 or epoch == d['num_epochs']-2 else False # if more than 5 epochs, save imgs for only every other epoch, 2nd to last, and last epoch 
-            losses = run_utils.train_UNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, UNet_id=UNet_id, epoch=epoch,  device=device, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
-            losses_avg.append(torch.mean(torch.FloatTensor(losses)))
+            loss = run_utils.train_Net(train_loader, model, loss_func, optimizer, bp_weight=d['bp_wght'], save_examples=save_examples, save_dir=exp_outdir, epoch=epoch)#train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, UNet_id=UNet_id, epoch=epoch,  device=device, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
+            losses.append(loss.cpu().detach().numpy())
 
         # Save model 
         torch.save(model.state_dict(), f'{exp_outdir}/{UNet_name}.pth')
         print(f'Saving trained model as {exp_outdir}/{UNet_name}.pth, and saving average losses', flush=True)
-        np.save(f'{exp_outdir}/losses', losses_avg)
+        np.save(f'{exp_outdir}/losses', np.array(losses))
 
     # Load it back in and save results on test data 
-    model = models.magNNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['padding_mode'])
+    if 'mag' in UNet_name:
+        model = models.magNet(in_channels=in_channels)
     model.load_state_dict(torch.load(f'{exp_outdir}/{UNet_name}.pth'))
     test_outdir = f'{exp_outdir}/test_preds_MURaM' if 'MURaM' in d['img_dir'] else f'{exp_outdir}/test_preds_DKIST'
-    run_utils.save_UNET_results(test_loader, save_dir=test_outdir, model=model, target_pos=target_pos)
+    if 'mag' in UNet_name:
+        run_utils.save_magNET_results(test_loader, save_dir=test_outdir, model=model)
+    else:
+        run_utils.save_UNET_results(test_loader, save_dir=test_outdir, model=model, target_pos=target_pos)
 
 
 if __name__ == "__main__":

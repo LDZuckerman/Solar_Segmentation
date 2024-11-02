@@ -1,6 +1,15 @@
+import torch.nn as nn
+import numpy as np
+import cv2
+import scipy.ndimage as sndi
+import torch
+import torch.nn.functional as F
+import os
+
 '''
 Loss functions for both supervised and WNet models
 '''
+# NOTE: what about also trying something that charecterizes the degree to which the pixels in one class are brighter than the pixels in the second brightest class?
 
 
 def multichannel_MSE_loss(x, x_prime, weights):
@@ -14,47 +23,91 @@ def multichannel_MSE_loss(x, x_prime, weights):
         mse = nn.MSELoss()(x[:,channel,:,:], x_prime[:,channel,:,:])
         loss += weights[channel]*mse
     loss = loss/(x.shape[1])
+    
+    if torch.isnan(loss).any() or not torch.isfinite(loss).all():
+        raise ValueError('loss has become NaN or inf')
 
     return loss
 
     
-def blobloss(outputs):
+def cohesion_loss(outputs, temp_dir):
     '''
     Metric describing how much the classes group pixels into circular blobs vs long shapes (e.g. outlines of other blobs)
     '''
-    preds = np.argmax(outputs.detach().numpy(), axis=1) # take argmax along classes axis
+    segs = np.argmax(outputs.cpu().detach().numpy(), axis=1) # FLATTEN TO [n_obs, n_pix, n_pix] masks by taking argmax along classes axis
     edge_pix = 0
-    for batch in range(preds.shape[0]):
-        cv2.imwrite("temp_img.png", preds[batch,:,:]) 
-        edges = np.array(cv2.Canny(cv2.imread("temp_img.png"),0,1.5))
-        edge_pix += len(edges[edges > 0])
-    loss = edge_pix/(preds.shape[0]*preds.shape[1]**2)
+    for batch in range(segs.shape[0]):
+        cv2.imwrite(f"{temp_dir}/temp_img.png", segs[batch,:,:]) 
+        edges = np.array(cv2.Canny(cv2.imread(f"{temp_dir}/temp_img.png"),0,1.5))
+        try:
+            edge_pix += len(edges[edges > 0])
+        except TypeError as E:
+            d = f"../{temp_dir}/temp_img.png"
+            raise ValueError(f'Error {E}\nedges is {edges}\ntemp img saved at {d}\nos.getcwd {os.getcwd()}\nos.path.exists({d}) {os.path.exists(d)}')
+    loss = edge_pix/(segs.shape[0]*segs.shape[1]**2)
 
     return loss
 
 
-def soft_n_cut_loss(image, enc, img_size, debug):
+def class_size_loss(outputs):
+    '''
+    Metric describing 
+    e.g. should encourage segmentations where two classes contain roughly similar N pixels, while the third contains significantly fewer
+    '''
+    
+    preds = outputs.cpu().detach().numpy() # no argmax, maintain one-hot layers
+    N0 = np.sum(preds[:,0,:,:])
+    N1 = np.sum(preds[:,1,:,:])
+    N2 = np.sum(preds[:,2,:,:])
+
+    N_low = np.min([N0, N1, N2])# number in the smallest class
+    N_high = np.max([N0, N1, N2]) # number in the largest class
+    N_mid = [N for N in [N0, N1, N2] if N not in [N_low, N_high]][0]
+    
+    #R1 = N_high/N_mid # should be ~1
+    R2 = N_low/np.mean([N_mid, N_high]) # should be << 1
+    
+    loss = R2 
+    
+    
+def region_size_loss(outputs):
+    '''
+    Ideally, want to identify/label each blob, then look at the distribution of sizes for blobs of each class
+        BP blobs are the ones that have the on average smallest size
+        IGr blobs are the one(s) with the smallest total num blobs
+    '''
+    
+    return loss
+
+    
+def continuity_loss(outputs):
+    '''
+    Metric describing the degree to which neighbouring pixels are the same class
+    '''
+
+    diff_h = torch.abs(outputs[:, :, 1:, :] - outputs[:, :, :-1, :])
+    diff_v = torch.abs(outputs[:, :, 1:] - outputs[:, :, :-1])
+    loss = torch.mean(diff_h) + torch.mean(diff_v)
+
+    return loss
+
+
+def soft_n_cut_loss(image, enc, img_size, debug=False):
     '''
     From https://github.com/AsWali/WNet/blob/master/utils
+    NOTE: operates on [n_obs, n_class, n_pix, n_pix], but should each class layer be a mask or probs??? Currently probs, which *I think* matches Xia implementation
     '''
-    try: 
-        if debug: print(f'\t  inside soft_n_cut_loss', flush=True)
-        loss = []
-        batch_size = image.shape[0]
-        k = enc.shape[1]
-        weights = calculate_weights(image, batch_size, img_size)
-    except Exception as e:
-        print('error above')
-        print(e)
+    if debug: print(f'\t  inside soft_n_cut_loss', flush=True)
+    loss = []
+    batch_size = image.shape[0]
+    k = enc.shape[1]
+    if debug: print(f'\t  calculated wieghts', flush=True)
+    weights = calculate_weights(image, batch_size, img_size)
     if debug: print(f'\t  k {k}', flush=True)
     for i in range(0, k):
-        try:
-            l = soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size, debug=debug)
-            if debug: print(f'\t    i {i}, computed l', flush=True)
-            loss.append(l) # GETS STUCK HERE WHEN RUN ON ALPINE? 
-        except Exception as e:
-            print('error in soft_n_cut_loss for i = {i}')
-            print(e)
+        l = soft_n_cut_loss_single_k(weights, enc[:, (i,), :, :], batch_size, img_size, debug=debug)
+        if debug: print(f'\t    i {i}, computed l', flush=True)
+        loss.append(l) # GETS STUCK HERE? 
     if debug: print(f'\t  losses appended to loss', flush=True)
     da = torch.stack(loss)
     if debug: print(f'\t  computed da', flush=True)
@@ -69,6 +122,7 @@ def calculate_weights(input, batch_size, img_size=(64, 64), ox=4, radius=5 ,oi=1
     From https://github.com/AsWali/WNet/blob/master/utils (for use in soft_n_cut_loss)
     '''
     channels = 1
+    input = torch.tensor(input) # in case running on npy
     image = torch.mean(input, dim=1, keepdim=True)
     h, w = img_size
     p = radius
@@ -99,6 +153,7 @@ def soft_n_cut_loss_single_k(weights, enc, batch_size, img_size, radius=5, debug
     '''
 
     channels = 1
+    enc = torch.tensor(enc) # in case running on npy
     h, w = img_size
     p = radius
     kh, kw = radius*2 + 1, radius*2 + 1
@@ -124,7 +179,7 @@ class multiclass_MSE_loss(nn.Module):
     def __init__(self):
         super(multiclass_MSE_loss, self).__init__()
 
-    def forward(self, outputs, targets, dm_weight=1, bp_weight=1):
+    def forward(self, outputs, targets, bp_weight, dm_weight=None):
         """
         Compute MSE between preds and targets for each layer (Ig, DM, ..etc). 
         Sum to get total, applying wieghting to small classes.
@@ -185,7 +240,7 @@ class OpeningLoss2D(nn.Module):
     def forward(self, labels: torch.Tensor, *args) -> torch.Tensor:
         r"""Computes the Opening loss -- i.e. the MSE due to performing a greyscale opening operation.
 
-        :param labels: Predicted class probabilities
+        :param labels: Predicted class probabilities [NOTE: NOT MASKS!]
         :param args: Extra inputs, in case user also provides input/output image values.
         :return: Opening loss
         """
@@ -199,3 +254,8 @@ class OpeningLoss2D(nn.Module):
             smooth_labels = smooth_labels.cuda()
 
         return nn.MSELoss()(labels, smooth_labels.detach())
+    
+
+def MSE(pred, truth):
+    mse = nn.MSELoss()
+    return mse(pred, truth)

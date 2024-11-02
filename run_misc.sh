@@ -7,18 +7,20 @@
 #SBATCH --mem=160G    # memory to request
 
 module load anaconda/2020.11
-conda activate torchenv
+conda activate torchenv_new
 
 cd Solar_Segmentation/
 
-while getopts "t:" flag; do
+task_flag='None'
+while getopts "t:f:" flag; do
  case $flag in
    t) task=$OPTARG;;
+   f) task_flag=$OPTARG;;
  esac
 done
 
-echo "Running task $task"
-python run_misc.py -task $task
+echo "Running task $task with flag $task_flag"
+python run_misc.py -task $task -flag $task_flag
 
 #####
 # run from ../ with 'sbatch Solar_Segmentation/run_misc.sh -t re-test'

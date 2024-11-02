@@ -10,7 +10,7 @@
 gpu=False
 
 module load anaconda/2020.11
-conda activate torchenv
+conda activate torchenv_new
 
 cd Solar_Segmentation/
 
@@ -21,8 +21,8 @@ while getopts "f:" flag; do
 done
 
 echo "Running experiment with expfile $expfile"
-python run_WNet.py -gpu $gpu -f $expfile
+python run_UNet.py -gpu $gpu -f $expfile
 
 #####
-# run from ../ with 'sbatch Solar_Segmentation/run_WNet.sh -f exp_file.json'
+# run from ../ with 'sbatch Solar_Segmentation/run_UNet.sh -f unet_exp_file.json'
 ######

@@ -12,15 +12,12 @@ def run_wnet_model(d, gpu, test_only=False):
     # Set out and data dirs
     WNet_name = d['WNet_name'] 
     WNet_id = d['WNet_name'].replace('WNet', '')
-    outdir = f"../WNet_runs" 
+    outdir = f"../model_runs_seg" 
     imgdir = d['img_dir']
     segdir = d['seg_dir']
-    if not os.path.exists(imgdir):
-        try: # if running from Solar_Segmentation/analysis/unsupervised.ipynb notebook for debugging
-            outdir='../'+outdir; imgdir = '../'+imgdir; segdir = '../'+segdir
-        except: 
-            raise Exception(f'Image directory {imgdir} does not exist.')
-    exp_outdir = f'{outdir}/{d["task_dir"]}/{WNet_name}/'
+    if not os.path.exists('../model_runs_seg'): # if running from Solar_Segmentation/analysis/unsupervised.ipynb notebook for debugging
+        outdir='../'+outdir
+    exp_outdir = f'{outdir}/{d["sub_dir"]}/{WNet_name}/'
     
     # Copy exp dict file for convenient future reference and create exp outdir 
     if not os.path.exists(exp_outdir): 
@@ -28,25 +25,39 @@ def run_wnet_model(d, gpu, test_only=False):
         os.makedirs(exp_outdir)
     elif not test_only:
         print(f'Experiment output dir {exp_outdir} already exists - contents will be overwritten')
-    print(f'Copying exp dict into {exp_outdir}/exp_file.json')
-    json.dump(d, open(f'{exp_outdir}/exp_file.json','w'))
+    if not test_only:
+        print(f'Copying exp dict into {exp_outdir}/exp_file.json')
+        json.dump(d, open(f'{exp_outdir}/exp_file.json','w'))
     
     # Get data (note: truth data not used in training of WNet, just loaded to easily store results)
     print(f"Loading data from {imgdir}", flush=True)
     channels = d['channels'] 
-    im_size = 128
-    in_channels = int(channels[0][channels[0].find('_')+1:]) if channels[0].startswith('time') else len(channels)
-    target_pos = int(np.floor(in_channels/2)) if channels[0].startswith('time') else 0 # position of target within channels axis
-    train_ds = data_utils.MyDataset(image_dir=imgdir, mask_dir=segdir, set='train', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'], 
+    im_size = d['img_size']
+    train_ds = data_utils.dataset(image_dir=imgdir, mask_dir=segdir, set='train', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size, add_mag=d['reconstruct_mag'], inject_brightmasks=d['inject_brightmasks']) # multichannel=True, channels=['deltaBinImg'], 
     train_loader = DataLoader(train_ds, batch_size=d['batch_size'], pin_memory=True, shuffle=True)
-    test_ds = data_utils.MyDataset(image_dir=imgdir, mask_dir=segdir, set='val', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'],
+    test_ds = data_utils.dataset(image_dir=imgdir, mask_dir=segdir, set='val', norm=False, n_classes=d['n_classes'], channels=channels, randomSharp=d['randomSharp'], im_size=im_size) # multichannel=True, channels=['deltaBinImg'],
     test_loader = DataLoader(test_ds, batch_size=d['batch_size'], pin_memory=True, shuffle=False)
-    data_utils.check_inputs(train_ds, train_loader, savefig=False, name=WNet_name)
+    data_utils.check_inputs(train_ds, train_loader, savefig=True, name=WNet_name, reconstruct_mag=d['reconstruct_mag'])
     
     # Define model
-    device = torch.device('cuda') if eval(str(gpu)) else torch.device('cpu') #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = models.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, kernel_size=d['kernel_size'], padding_mode=d['padding_mode']).to(device)
-    
+    device = torch.device('cuda') if eval(str(gpu)) else torch.device('cpu') # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if eval(str(d['reconstruct_mag'])): # last "channel" is just flux that is tacked on 
+        print(f'reconstruct_mag is True')
+        in_channels = int(channels[0][channels[0].find('_')+1:]) if channels[0].startswith('time')-1 else len(channels)-1
+        out_channels =  in_channels + 1
+    else:
+        in_channels = int(channels[0][channels[0].find('_')+1:]) if channels[0].startswith('time') else len(channels)
+        out_channels = in_channels
+    target_pos = int(np.floor(in_channels/2)) if channels[0].startswith('time') else 0 # position of target within channels axis 
+    if str(d['pretrained_dec']) != 'None':
+        if not os.path.exists(f'../model_runs_dec/MURaM/{d["pretrained_dec"]}'):
+            raise ValueError(f'Pre-trained decoder ../model_runs_dec/MURaM/{d["pretrained_dec"]} does not exist.')
+        else:
+            print(f'Reading in pre-trained decoder {d["pretrained_dec"]}. This will be used to initialize the decoder wieghts.')
+            dec_channels = json.load(open(f'../model_runs_dec/MURaM/{d["pretrained_dec"]}/exp_file.json'))['channels']
+            if d['channels'] != dec_channels:
+                raise ValueError(f'Channels expected by this model ({d["channels"]}) not the same as channels that indicated dec has been trained to reproduce ({dec_channels})')
+    model = models.WNet(in_chans=in_channels, n_classes=d['n_classes'], out_chans=out_channels, dec_depth=d['dec_depth'], double_dec=eval(str(d['double_dec'])), dec_ch_mul=64, kernel_size=d['kernel_size'], padding_mode=d['padding_mode'], reconstruct_mag=eval(str(d['reconstruct_mag'])), pretrained_dec=d['pretrained_dec'], activation=eval(str(d['activation']))).to(device)                                                                                                                                    
     # Create outdir and train 
     if not eval(str(test_only)):
 
@@ -58,7 +69,7 @@ def run_wnet_model(d, gpu, test_only=False):
         for epoch in range(d['num_epochs']):
             print(f'Epoch {epoch}', flush=True)
             save_examples = True if d['num_epochs'] < 4 or epoch % 2 == 0 or epoch == d['num_epochs']-1 or epoch == d['num_epochs']-2 else False # if more than 5 epochs, save imgs for only every other epoch, 2nd to last, and last epoch 
-            enc_losses, rec_losses = run_utils.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, WNet_id=WNet_id, smooth_wght=d['smooth_wght'], blob_wght=d['blob_wght'], ncut_wght=d['ncut_wght'], epoch=epoch,  device=device, train_enc_sup=False, freeze_dec=False, target_pos=target_pos, weights=d['weights'], save_examples=save_examples)
+            enc_losses, rec_losses = run_utils.train_WNet(train_loader, model, optimizer, k=d['n_classes'], img_size=(d['img_size'], d['img_size']), exp_outdir=exp_outdir, WNet_id=WNet_id, smooth_wght=d['smooth_wght'], cohesion_wght=d['chsn_wght'], ncut_wght=d['ncut_wght'], cont_wght=d['cont_wght'], epoch=epoch,  device=device, target_pos=target_pos, weights=d['weights'], reconstruct_mag=d['reconstruct_mag'], save_examples=save_examples, temp_dir=exp_outdir)
             n_cut_losses_avg.append(torch.mean(torch.FloatTensor(enc_losses)))
             rec_losses_avg.append(torch.mean(torch.FloatTensor(rec_losses)))
 
@@ -69,10 +80,11 @@ def run_wnet_model(d, gpu, test_only=False):
         np.save(f'{exp_outdir}/rec_losses', rec_losses_avg)
 
     # Load it back in and save results on test data 
-    model = models.MyWNet(squeeze=d['n_classes'], ch_mul=64, in_chans=in_channels, out_chans=in_channels, padding_mode=d['padding_mode'])
+    model = models.WNet(in_chans=in_channels, n_classes=d['n_classes'], out_chans=out_channels, dec_depth=d['dec_depth'], double_dec=eval(str(d['double_dec'])), dec_ch_mul=64, kernel_size=d['kernel_size'], padding_mode=d['padding_mode'], reconstruct_mag=eval(str(d['reconstruct_mag'])), pretrained_dec=d['pretrained_dec'], activation=eval(str(d['activation']))).to(device)                                                                                                                                    
+    print(f'Loading model back in from {exp_outdir}/{WNet_name}.pth and testing')
     model.load_state_dict(torch.load(f'{exp_outdir}/{WNet_name}.pth'))
     test_outdir = f'{exp_outdir}/test_preds_MURaM' if 'MURaM' in d['img_dir'] else f'{exp_outdir}/test_preds_DKIST'
-    run_utils.save_WNET_results(test_loader, save_dir=test_outdir, model=model, target_pos=target_pos)
+    run_utils.save_WNET_results(test_loader, save_dir=test_outdir, model=model, target_pos=target_pos, device=device)
 
 
 if __name__ == "__main__":

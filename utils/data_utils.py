@@ -8,39 +8,62 @@ import astropy.io.fits as fits
 import os
 import matplotlib.pyplot as plt
 import skimage as sk
+import skimage
 import scipy.stats as stats
 import torch
 import torchvision.transforms as transforms
+import scipy.ndimage as sndi
 from torch.utils.data import Dataset
+import random
+try:
+    import eval_utils
+except ModuleNotFoundError:
+    from utils import eval_utils
 
 
 ###############
 # Dataset class
 ###############
 
-class MyDataset(Dataset):
+class dataset(Dataset):
     '''
     Dataset class for loading images and labels from a directory.
     '''
-    def __init__(self, image_dir, mask_dir, set, norm=False, channels=['X'], n_classes=2, randomSharp=False, im_size=None):
-        self.image_dir = f'{image_dir}{set}'
-        self.mask_dir = f'{mask_dir}{set}'
+    def __init__(self, image_dir, mask_dir, set, norm=False, channels=['X'], n_classes=2, randomSharp=False, im_size=None, add_mag=False, seg_as_input=False, inject_brightmasks=False):
+        self.dpath = '../Data/' if os.path.exists('../Data/') else '../../Data/' if os.path.exists('../../Data') else 'error'
+        # if 'fullnorm' not in image_dir:
+        #     raise ValueError('Appear to have choosen non-normalized datasets. Is this intentional?')
+        self.image_dir = f'{self.dpath}{image_dir}{set}'
+        self.mask_dir = f'{self.dpath}{mask_dir}{set}'
         self.set = set
-        self.images = os.listdir(f'{image_dir}{set}')
+        self.images = os.listdir(f'{self.image_dir}')
+        if 'pred_Bz' in channels: # need to remove img subsecs correspding to image 018000 for which Benoit did not run DeepVel
+            print(f'Removing images with 180000. Initial length {len(self.images)}')
+            self.images = [f for f in self.images if '018000' not in f]
+            print(f'New length {len(self.images)}')
+        if eval(str(inject_brightmasks)) and self.set == 'train':
+            skip = 10
+            self.bright_masks = get_brightmasks(self.image_dir, self.images, N=int(len(self.images)/skip))
+            self.images = inject_brightmask_flags(self.images, skip) # place 'mask_flag' placeholder after every 3rd image path   
         self.norm = norm
         self.channels = channels
         self.n_classes = n_classes
         self.randomSharp = eval(str(randomSharp))
         self.im_size = im_size
         self.resize = transforms.Resize(im_size, antialias=None)
+        self.add_mag = eval(str(add_mag))
+        self.seg_as_input = eval(str(seg_as_input))
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, index):
         # Get image
-        img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image (or SET of [20, npix, npix] if timeseries)
-        img = np.load(img_path)
+        if self.images[index] != 'mask_flag':
+            img_path = os.path.join(self.image_dir, self.images[index]) # path to one data image (or SET of [20, npix, npix] if timeseries)
+            img = np.load(img_path)
+        else:
+            img = self.bright_masks[np.random.choice(np.linspace(0,len(self.bright_masks)-1,len(self.bright_masks),dtype=int),1)[0]] # shouldn't really matter if I repeat
         if np.max(img) > 1:
             raise ValueError('This image does not appear to come from a pre-normalized set')
         if img.dtype.byteorder == '>':
@@ -58,51 +81,88 @@ class MyDataset(Dataset):
         if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 5 times, for WNet
             img = np.array(self.resize(torch.from_numpy(np.expand_dims(img, axis=0)))).squeeze()
         if self.channels != ['X']: # Add feature layers
-            if self.channels[0].startswith('timeseries'):
-                tag = self.channels[0][self.channels[0].find('ies')+3:]
-                image = fill_timeseries(img, tag)
-            else:
-                image = np.zeros((len(self.channels), img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
-                image[0, :, :] = img
-                for i in range(1, len(self.channels)):
-                    image[i, :, :] = get_feature(img, self.channels[i], index, self.images[index], img_path, self.resize, self.set)
-        else: # Add dummy axis
+            if self.images[index] != 'mask_flag' :
+                if self.channels[0].startswith('timeseries'):
+                    tag = self.channels[0][self.channels[0].find('ies')+3:]
+                    image = fill_timeseries(img, tag)
+                else:
+                    image = np.zeros((len(self.channels), img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                    for i in range(len(self.channels)):
+                        if self.channels[i] == 'X': # usually I'm having first channel be image
+                            image[i, :, :] = img
+                        else:
+                            image[i, :, :] = get_feature(img, self.channels[i], index, self.images[index], img_path, self.dpath, self.resize, self.set)
+            else: # just fill channels with the same brightmask
+                image = np.zeros((len(self.channels), img.shape[0], img.shape[1]), dtype=np.float32) 
+                for i in range(len(self.channels)):
+                    image[i, :, :] = im
+        else: # Add dummy axis (could probabaly have used expand_dims)
             image = np.zeros((1, img.shape[0], img.shape[1]), dtype=np.float32) # needs to be float32 not float64
             image[0, :, :] = img
+        if self.add_mag: # adding in the mag data here and then just removing it before passing to enc is the only way I can think of to have it accesable to use in the rec loss
+            raise ValueError('add_mag is True. Is this intentional?')
+            #image.append(get_feature(img, 'Bz', index,  self.images[index], img_path, self.dpath, self.resize, self.set),  axis=  )
+            out = np.zeros((len(self.channels)+1, img.shape[0], img.shape[1]), dtype=np.float32)
+            out[0:-1,:,:] = image
+            out[-1,:,:] = get_feature(img, 'Bz', index,  self.images[index], img_path, self.dpath, self.resize, self.set)
+            image = out
         # Get labels
-        mask_path = os.path.join(self.mask_dir, 'SEG_'+self.images[index]) # path to one labels image (use name, not idx, for safety)
-        labels = np.load(mask_path).newbyteorder().byteswap() 
-        if self.n_classes==4: # One-hot encode targets so they are the correct size
-            mask = np.zeros((4, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
-            mask_gr, mask_ig, mask_bp, mask_dm = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
-            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
-            mask_dm[labels == 0.5] = 1 # 1 where dim middle, 0 elsewhere
-            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
-            mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
-            mask[0, :, :] = mask_ig
-            mask[1, :, :] = mask_dm
-            mask[2, :, :] = mask_gr
-            mask[3, :, :] = mask_bp
-        if self.n_classes==3: # One-hot encode targets so they are the correct size
-            mask = np.zeros((3, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
-            mask_gr, mask_ig, mask_bp = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
-            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
-            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
-            mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
-            mask[0, :, :] = mask_ig
-            mask[1, :, :] = mask_gr
-            mask[2, :, :] = mask_bp
-        elif self.n_classes==2: # One-hot encode targets so they are the correct size
-            mask = np.zeros((2, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
-            mask_gr, mask_ig = np.zeros_like(labels), np.zeros_like(labels)
-            mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
-            mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
-            mask[0, :, :] = mask_ig
-            mask[1, :, :] = mask_gr
-        if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 4 times, for WNet
-            mask = np.array(self.resize(torch.from_numpy(mask)))
+        if 'mag_' in self.mask_dir: # same as "get_feature", but dont square or normalize (so that can load predictions into WNet same as MURaM mag)
+            norm_tag = 'full' if 'full' in self.image_dir else ''
+            mag_path = f'{self.dpath}/UNetData_MURaM/{norm_tag}norm_mag_images/{self.set}/{self.images[index]}' # path to one mag image 
+            mag = np.load(mag_path).newbyteorder().byteswap()
+            true = np.array(self.resize(torch.from_numpy(np.expand_dims(mag, axis=0)))) # dont remove dummy axis
+        else:
+            if self.images[index] != 'mask_flag' :
+                if 'TSeries' in self.image_dir:
+                    start = self.images[index][0:6]
+                    end = self.images[index][8:14]
+                    region = self.images[index][15]
+                    segstamp = "{:06d}".format(int(start)+int((int(end)-int(start))/2))
+                    seg_name = f'SEG_{segstamp}__{region}.npy'
+                else:
+                    seg_name = 'SEG_'+self.images[index] # path to one labels image (use name, not idx, for safety)
+                mask_path = os.path.join(self.mask_dir, seg_name) 
+                labels = np.load(mask_path).newbyteorder().byteswap() 
+                if self.n_classes==4: # One-hot encode targets so they are the correct size
+                    mask = np.zeros((4, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                    mask_gr, mask_ig, mask_bp, mask_dm = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
+                    mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+                    mask_dm[labels == 0.5] = 1 # 1 where dim middle, 0 elsewhere
+                    mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+                    mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
+                    mask[0, :, :] = mask_ig
+                    mask[1, :, :] = mask_dm
+                    mask[2, :, :] = mask_gr
+                    mask[3, :, :] = mask_bp
+                if self.n_classes==3: # One-hot encode targets so they are the correct size
+                    mask = np.zeros((3, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                    mask_gr, mask_ig, mask_bp = np.zeros_like(labels), np.zeros_like(labels), np.zeros_like(labels)
+                    mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+                    mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+                    mask_bp[labels == 1.5] = 1 # 1 where bright point, 0 elsewhere
+                    mask[0, :, :] = mask_ig
+                    mask[1, :, :] = mask_gr
+                    mask[2, :, :] = mask_bp
+                elif self.n_classes==2: # One-hot encode targets so they are the correct size
+                    mask = np.zeros((2, labels.shape[0], labels.shape[1]), dtype=np.float32) # needs to be float32 not float64
+                    mask_gr, mask_ig = np.zeros_like(labels), np.zeros_like(labels)
+                    mask_ig[labels == 0] = 1 # 1 where intergranule, 0 elsewhere
+                    mask_gr[labels == 1] = 1 # 1 where granule, 0 elsewhere
+                    mask[0, :, :] = mask_ig
+                    mask[1, :, :] = mask_gr
+                else:
+                    raise ValueError(f'n_classes must be 2, 3, or 4, not {self.n_classes}')
+            else: # create dummy seg (this is just for plotting and stuff anyway)
+                mask = np.zeros((self.n_classes, img.shape[0], img.shape[1]))
+            if self.im_size != None: # cut to desired size, e.g. to make divisible by 2 4 times, for WNet
+                mask = np.array(self.resize(torch.from_numpy(mask)))
+            true = mask
 
-        return image, mask
+        if self.seg_as_input: # if this dataset will be used to pre-train a decoder unet to predict images from segs
+            return true, image 
+        else:
+            return image, true
 
 
 #######################################
@@ -114,44 +174,26 @@ def fill_timeseries(img, tag):
     Create a timeseries of images around the target image.
     '''
 
-    if tag == '20_5':
+    if tag == '40_5': #'20_5':
         image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
         image[1, :, :] = img[5, :, :]
         image[2, :, :] = img[10, :, :] # target image (is it important to put this here?)
         image[3, :, :] = img[15, :, :]
-        image[4, :, :] = img[19, :, :] # should've probabaly done sets of 21.. oh well
-    elif tag == '40_5':
+        image[4, :, :] = img[20, :, :] # these are sets of 21
+    elif tag == '80_5': # '40_5'
         image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
         image[0, :, :] = img[0, :, :]
         image[1, :, :] = img[10, :, :]
         image[2, :, :] = img[20, :, :] # target image (is it important to put this here?)
         image[3, :, :] = img[30, :, :]
         image[4, :, :] = img[40, :, :] # these sets are 41
-    elif tag == '80_5':
-        image = np.zeros((5, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
-        image[0, :, :] = img[0, :, :]
-        image[1, :, :] = img[20, :, :]
-        image[2, :, :] = img[40, :, :] # target image (is it important to put this here?)
-        image[3, :, :] = img[60, :, :]
-        image[4, :, :] = img[80, :, :] # these sets are 81
-    elif tag == '40_9':
-        image = np.zeros((9, img.shape[1], img.shape[2]), dtype=np.float32) # needs to be float32 not float64
-        image[0, :, :] = img[0, :, :]
-        image[1, :, :] = img[5, :, :]
-        image[2, :, :] = img[10, :, :] 
-        image[3, :, :] = img[15, :, :]
-        image[4, :, :] = img[20, :, :] # target image (is it important to put this here?)
-        image[5, :, :] = img[25, :, :]
-        image[6, :, :] = img[30, :, :]
-        image[7, :, :] = img[35, :, :] 
-        image[8, :, :] = img[40, :, :] # these sets are 41
     else: 
         raise ValueError(f'Timeseries tag {tag} not recognized')
     
     return image
 
-def get_feature(img, name, index, image_name, imgpath, resize, set=None):
+def get_feature(img, name, index, image_name, imgpath, dpath, resize, set=None):
     '''
     Add desired feature layers to the image.
     '''
@@ -162,12 +204,22 @@ def get_feature(img, name, index, image_name, imgpath, resize, set=None):
         n = int(name[-1])
         a = img**n
     elif name == 'Bz':
-        mag_path = f'../Data/UNetData_MURaM/mag_images/{set}/{image_name}' # path to one mag image 
+        norm_tag = 'full' if 'full' in imgpath else ''
+        mag_path = f'{dpath}/UNetData_MURaM/{norm_tag}norm_mag_images/{set}/{image_name}' # path to one mag image 
         mag = np.load(mag_path).newbyteorder().byteswap()
         if mag.shape != img.shape: # if img_size != None above, so cut img to desired size, need to do that for mag
             mag = np.array(resize(torch.from_numpy(np.expand_dims(mag, axis=0)))).squeeze()
         mag = mag**2
-        a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal 
+        if 'stdnorm' in name:
+            a = (mag - np.mean(mag))/np.std(mag)
+        else:
+            a = mag # normalizing to std normal makes range go to like  [-4, 8] instead of [0,1], and I think instead I should just weight mag more in loss?? #a = (mag - np.mean(mag))/np.std(mag) # normalize to std normal 
+    elif name == 'pred_Bz':
+        mag_path = f'{dpath}/UNetData_MURaM/fullnorm_DVmag_images/{set}/{image_name}' # path to one mag image 
+        mag = np.load(mag_path).newbyteorder().byteswap()
+        if mag.shape != img.shape: # if img_size != None above, so cut img to desired size, need to do that for mag
+            mag = np.array(resize(torch.from_numpy(np.expand_dims(mag, axis=0)))).squeeze()
+        a = mag**2
     # elif name == 'binary_residual':
     #     im_scaled = (img-np.min(img))/(np.max(img)-np.min(img))
     #     if set == 'train':
@@ -189,53 +241,92 @@ def get_feature(img, name, index, image_name, imgpath, resize, set=None):
     #     wnet8_preds_smooth = cv2.filter2D(wnet8_preds, -1, kernel)
     #     a = (wnet8_preds_smooth - im_scaled)**2 
     elif name == 'median_residual':
-        meddir = f'{imgpath[0:imgpath.find("norm_images/")]}med8_images/{set}/'
+        norm_tag = 'full' if 'full' in imgpath else ''
+        if 'MURaM' in imgpath:   # min and max of res (img-med8) # mean = 0.000368; sd = 0.019967 (what was this from?)
+            full_min = -0.28 
+            full_max = 0.69
+        else:
+            raise ValueError('Need to calculate full min and max for img-med8 for DKIST set')
+        meddir = f'{imgpath[0:imgpath.find(f"{norm_tag}norm_images/")]}{norm_tag}norm_med8_images/{set}/'
         if os.path.exists(meddir):
             med_path = f'{meddir}med8_{image_name}'
             med = np.load(med_path)
             if np.shape(med) != np.shape(img): # already cut down image
-                med = np.array(transform(torch.from_numpy(np.expand_dims(med, axis=0)))).squeeze()
-            a = img - med
+                med = np.array(resize(torch.from_numpy(np.expand_dims(med, axis=0)))).squeeze()
+            res = img - med
         else: 
             if set == 'val': # didint save for test set - instead just compute here
-                s = 8
-                a = img - sndi.median_filter(img, size=s)
+                res = img - sndi.median_filter(img, size=8)
             else:
                 raise FileNotFoundError(f'Median filtered images not saved for this set ({meddir} does not exist).')
-        if 'MURAM' in imgpath: 
-            mean = 0.000368; sd = 0.019967
-            a = (a - mean)/sd
+        a = ((res - full_min)/(full_max - full_min))
+    elif 'v' in name:
+        vel_path = f'{dpath}/UNetData_MURaM/fullnorm_{name}_images/{set}/{image_name}' # path to one v_i image 
+        vel = np.load(vel_path).newbyteorder().byteswap()
+        if vel.shape != img.shape: # if img_size != None above, so cut img to desired size, need to do that for mag
+            a = np.array(resize(torch.from_numpy(np.expand_dims(vel, axis=0)))).squeeze()
     else: raise ValueError(f'Channel name {name} not recognized')
 
     return a
 
-def check_inputs(train_ds, train_loader, savefig=False, name=None):
+def inject_brightmask_flags(images, skip):
+    
+    for i in range(0, len(images)-skip):
+        images.insert(skip*i, 'mask_flag')
+        
+    return images
+
+def get_brightmasks(image_dir, images, N, threshold=0.8):
+    '''
+    NOTE: these are not even "BPs" as identified by alg seg, just literally masks of high intensity regions
+    '''
+    bright_masks = []
+    for image in images:
+        im = np.load(os.path.join(image_dir, image))
+        brightmask = np.copy(im)
+        brightmask[im < threshold] = 0
+        if np.sum(brightmask.flatten()) > 0: 
+            bright_masks.append(brightmask) # if there are some "bps"   
+    random.shuffle(bright_masks)
+    
+    return bright_masks
+
+def check_inputs(train_ds, train_loader, savefig=False, name=None, reconstruct_mag=False):
     '''
     Check data is loaded correctly
     '''
     print('Train data:')
-    print(f'     {len(train_ds)} obs, broken into {len(train_loader)} batches')
-    train_features, train_labels = next(iter(train_loader))
-    shape = train_features.size()
-    print(f'     Each batch has data of shape {train_features.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (features)')
-    shape = train_labels.size()
-    print(f'     Each batch has labels of shape {train_labels.size()}, e.g. {shape[0]} images, {[shape[2], shape[3]]} pixels each, {shape[1]} layers (classes)')
+    print(f'\t{len(train_ds)} obs, broken into {len(train_loader)} batches')
+    train_input, train_labels = next(iter(train_loader))
+    in_shape = train_input.size()
+    in_layers = in_shape[1]
+    N1 = in_shape[2]; N2 = in_shape[3]
+    if not eval(str(reconstruct_mag)):
+        print(f'\tEach batch has data of shape {train_input.size()}, e.g. {in_shape[0]} images, {[N1, N2]} pixels each, {in_layers} layers (features)')
+    else: print(f'\tEach batch has data of shape {train_input.size()}, e.g. {in_shape[0]} images, {[N1, N2]} pixels each, {in_layers} layers where {in_layers-1} are features and 1 is mag flux')
+    out_shape = train_labels.size()
+    out_layers = out_shape[1]
+    N1 = out_shape[2]; N2 = out_shape[3]
+    print(f'\tEach batch has labels of shape {train_labels.size()}, e.g. {out_shape[0]} images, {[N1, N2]} pixels each, {out_layers} layers (classes)')
     if savefig:
-        fig, axs = plt.subplots(7, 3, figsize=(3*4, 7*4))
-        axs[0,0].set_title('image[0]')
-        #ax2.set_title('image[1]')
-        axs[0,2].set_title('labels')
-        for i in range(7):
-            X, y = next(iter(train_loader))
-            y = onehot_to_map(y)
-            im1 = axs[i,0].imshow(X[0,0,:,:], vmin=0, vmax=1); plt.colorbar(im1, ax=axs[i,0]) # first img in batch, first channel
-            if X.shape[1] > 1: im2 = axs[i,1].imshow(X[0,1,:,:], vmin=0, vmax=1); plt.colorbar(im2, ax=axs[i,1]) # first img in batch, first channel
-            im3 = axs[i,2].imshow(y[0,:,:]); plt.colorbar(im3, ax=axs[i,2]) # first y in batch, already class-collapsed
-        plt.savefig(f'traindata_{name}'); a=b
+        n_col = in_layers + out_layers
+        N =20
+        fig, axs = plt.subplots(N, n_col, figsize=(n_col*4, N*4))
+        for i in range(N):
+            X, y = next(iter(train_loader)) # next batch
+            #y = eval_utils.onehot_to_map(y)
+            for j in range(in_layers):
+                im = axs[i,j].imshow(X[0,j,:,:]); plt.colorbar(im, ax=axs[i,j]) # vmin=0, vmax=1 # ith img in batch, jth channel
+                axs[0,j].set_title(f'input layer {j}')
+            for j in range(out_layers):
+                im = axs[i,in_layers+j].imshow(y[0,j,:,:]); plt.colorbar(im, ax=axs[i,in_layers+j]) # first y in batch, already class-collapsed
+                axs[0,in_layers+j].set_title(f'truth (or alg seg) layer {j}')
+        model_dir = 'model_runs_seg' if ('WNet' in name or 'TrNet' in name) else 'model_runs_dec' if 'dec' in name else 'model_runs_enc' if 'enc' in name else 'model_runs_mag'
+        plt.savefig(f'../{model_dir}/MURaM/{name}/traindata_{name}')
 
 
 ###############
-# Preprocessing 
+# prerocessing 
 ###############
 
 def histogram_equalization(data, n_bins=256):
@@ -287,21 +378,32 @@ def hist_matching(data_in, cdf_in, bins_in, cdf_out, bins_out):
     data_out = np.interp(cdf_tmp, cdf_out.flatten(), bins_out.flatten())
     return data_out
 
-def pre_proccess(data, labels, gradientFeats=True, kernalFeat=True):
-
+def preproccess(data, labels, segmentation=False, medianFilter=True, gradients=True, kernels=False):
+    
     # Flatten features and labels
     dataflat = data.reshape(-1)
-    labelsflat = labels.reshape(-1)
+    labelsflat = labels.reshape(-1) 
     # Put features and labels into df
     df = pd.DataFrame()
-    df['OG_value'] = dataflat
-    df = add_kernel_feats(df, dataflat) # Add values of different filters as features
-    df = add_gradient_feats(df, data) # Add value of gradient as feature
+    df['value'] = dataflat
+    if medianFilter:
+        df['med8'] = sndi.median_filter(data, size=8).reshape(-1)
+        df['med8res'] = df['value'] - df['med8']
+    if gradients: #df = add_gradient_feats(df, data) 
+        df['gradienty'] = np.gradient(data)[0].reshape(-1)
+        df['gradientx'] = np.gradient(data)[1].reshape(-1)   
+    if kernels:
+        raise ValueError('Why was I doing this on the flattened array?')
+        df = add_kernel_feats(df, dataflat) # Add values of different filters as features
     df['labels'] =  labelsflat
     # Make X and Y
     X =  df.drop(labels =["labels"], axis=1)
     Y = df['labels']
-    Y = preprocessing.LabelEncoder().fit_transform(Y) # turn floats 0, 1, to categorical 0, 1
+    # If classification instead of regression, encode labels
+    if segmentation:
+        Y = preprocessing.LabelEncoder().fit_transform(Y) # turn floats 0, 1, to categorical 0, 1
+
+            
     return X, Y
 
 def post_process(preds, data=None):
@@ -311,7 +413,7 @@ def post_process(preds, data=None):
     # If its a 2-value seg
     if len(np.unique(preds)) == 2:
         # Assign a number to each predicted region
-        labeled_preds = skimage.measure.label(preds + 1, connectivity=2)
+        labeled_preds = sk.measure.label(preds + 1, connectivity=2)
         values = np.unique(labeled_preds)
         # Find numbering of the largest region (IG region)
         size = 0
@@ -937,3 +1039,148 @@ def fits_to_map(filename):
     data_map = sunpy.map.Map(filename)
 
     return data_map
+
+
+'''
+Kevin's madmax function
+'''
+
+def madmax(input_image, scaling=1.0):
+
+    '''
+    ;-------------------------------------------------------------
+    ;
+    ; NAME:
+    ;      MADMAX 
+    ;      also called " Octodirectional Maxima of Convexities" (OMC).
+    ; PURPOSE:
+    ;      This function will determine a multidirectional
+    ;      maximum of ( - second derivative ) using 8 directions 
+    ;      and step=2.
+    ; CATEGORY:
+    ;      IMAGE PROCESSING
+    ; CALLING SEQUENCE:
+    ;      deriv_maxval,deriv_maxpos = madmax(input_image, scaling=1)
+    ; INPUTS:
+    ;      input_image = initial data array
+    ;        type: array,any type,arr(nx,ny)
+    ; KEYWORD PARAMETERS:
+    ; OUTPUTS:
+    ;      deriv_maxval = resulting array of max ( - 2nd derivative )
+    ;        type: array,floating point,fltarr(nx,ny)
+    ;      deriv_maxpos = associated array of directions with values
+    ;        1 to 8. (Optional)
+    ;        type: array,integer,intarr(nx,ny)
+    ;      deriv_meanpos = associated array of average 2nd derivatives
+    ;        type: array,floating point,fltarr(nx,ny)
+    ; COMMON BLOCKS:
+    ; NOTES:
+    ;     a/ Numerical exp-t with the "OMC" algorithm showed that the use
+    ;     of the MadMax operator often gives a greatly enhanced image
+    ;     showing structures with an improved S/N ratio. However,
+    ;     the value of the optimum step to be used is NOT specified here.
+    ;     It is the responsability of the user to make the 'right' choice
+    ;     for the optimum step; for that, the best method is to try 
+    ;     MadMax on rebined data of increased, by a factor 2, steps, until 
+    ;     a satisfactory result is obtained... (or use the function 
+    ;     'shrink' on the data- matrix). 
+    ;     Printing the resulting image should be made carefully. If
+    ;     discontinuity like features exist in the original image, very high
+    ;     amplitudes will result from Madmax. Then it is necessary to rescale
+    ;     the "madmaxed" image.
+    ;     b/ Comments or suggestions could be send to Serge K. at 
+    ;     skoutchmy@solar.stanford.edu. 
+    ;     c/ A Fortran version of MadMax is available on request.
+    ; 
+    ;      Olga Koutchmy is from L'Universite Pierre et Marie Curie,
+    ;      Laboratoire Analyse Numerique,Paris.
+    ; MODIFICATION HISTORY:
+    ;      K. Reardon,  03 Sep, 2024 --- Ported to Python
+    ;      O. Koutchmy, 24 Sep, 1992 --- Matrix border by extrapolation.
+    ;      H. Cohl,     28 Feb, 1992 --- Modification for IDL 2.
+    ;      O. Koutchmy, 1 July, 1990 --- Initial implementation.
+    ; REFERENCE:
+    ;     Koutchmy,O. and Koutchmy, S. (1988), "Optimum Filter and Frame 
+    ;     Integration- Application to Granulation Pictures", in
+    ;     Proceedings of the 10 th NSO/SPO workshop on "High Spatial 
+    ;     Resolution Solar Obs.", 1989, 217, O. von der Luhe Ed.
+    ;-------------------------------------------------------------
+    '''
+    import numpy as np
+    import scipy.interpolate as interp
+    import scipy.ndimage as ndimage
+
+    size_orig_x, size_orig_y = input_image.shape
+
+    # limit scaling to a reasonable range 
+    # (no upscaling, max 32 downscaling)
+    maxn = 32
+    minn = 1
+    scaling = max(min(maxn, scaling*1.0), minn)
+
+    # if image rescaling is required, change image size
+    if scaling > 1:
+        size_new_x      = int(size_orig_x / scaling)
+        size_new_y      = int(size_orig_y / scaling)
+    
+        axisrange       = lambda x: np.linspace(0, 1, x)
+        interp_scl      = interp.RegularGridInterpolator((axisrange(size_orig_x), axisrange(size_orig_y)), input_image, 'linear')
+        new_x, new_y    = np.meshgrid(xrange(size_new_x), xrange(size_new_y), indexing='ij')
+        input_image_scl = interp_scl((new_x, new_y), 'linear')
+    else:
+        input_image_scl = input_image
+    
+    size_x, size_y      = input_image_scl.shape
+
+    # derive shift steps in eight different directions
+    shifts_x = [ 0, -1, -2, -2, -2, -2, -2, -1]
+    shifts_y = [-2, -2, -2, -1,  0,  1,  2,  2]
+    # calculate distance of shift in each of the eight directions
+    scale_dist = np.power(shifts_x,2) + np.power(shifts_y,2)
+    #print(1/scale_dist)
+    
+    derivs = np.zeros([size_x, size_y, 8], dtype=float)
+    img_empty = np.zeros([size_x, size_y], dtype=float) + np.mean(input_image_scl)
+    input_image_mean = np.mean(input_image_scl)
+
+    # now loop through each of the eight directions and compute the gradient in the 
+    # positive and negative directions
+    # sum the two gradients - if they are of the same sign, that doesn't indicate a local convexity
+    # if they are of opposite signs they will (roughly) cancel
+    for dirn in range(0,8):
+        imsft_neg        = ndimage.shift(input_image_scl,  [shifts_x[dirn],  shifts_y[dirn]], cval=input_image_mean, mode='constant')
+        imsft_pos        = ndimage.shift(input_image_scl, [-shifts_x[dirn], -shifts_y[dirn]], cval=input_image_mean, mode='constant')
+        imsft_deriv      = (imsft_neg + imsft_pos) / 2.
+        im_diff          = (input_image_scl - imsft_deriv)
+        # this could also be written as  
+        #     ((input_image_scl - imsft_neg) + (input_image_scl - imsft_pos)) / 2.
+        # which is more clear about this being the sum of two gradients (of opposite signs for a continuous spatial change)
+        derivs[:,:,dirn] = im_diff / scale_dist[dirn]
+
+    # extract the maximum curvature value from the eight different directions
+    deriv_maxval   = np.max(derivs, axis=2)
+    # normalize the curvature values to be all positive
+    deriv_maxval  += -np.min(deriv_maxval)
+    # extract the direction of maximum curvature from the eight different directions
+    deriv_maxpos   = np.argmax(derivs, axis=2)
+    # find the average curvature 
+    deriv_meanval  = np.max(derivs, axis=2)
+
+
+    # if the images were downscaled prior to the calculation of the gradients, 
+    # rescale them back to the original size
+    if scaling > 1:
+        size_new_x      = int(size_orig_x)
+        size_new_y      = int(size_orig_y)
+        new_x, new_y    = np.meshgrid(xrange(size_new_x), xrange(size_new_y), indexing='ij')
+    
+        axisrange       = lambda x: np.linspace(0, 1, x)
+        interp_scl      = interp.RegularGridInterpolator((axisrange(size_x), axisrange(size_y)), deriv_maxval, 'linear')
+        deriv_maxval    = interp_scl((new_x, new_y), 'linear')
+        
+        interp_scl      = interp.RegularGridInterpolator((axisrange(size_x), axisrange(size_y)), deriv_maxpos, 'linear')
+        deriv_maxpos    = interp_scl((new_x, new_y), 'linear')
+        interp_scl      = interp.RegularGridInterpolator((axisrange(size_x), axisrange(size_y)), deriv_meanval, 'linear')
+        deriv_meanval    = interp_scl((new_x, new_y), 'linear')
+
+    return(deriv_maxval,deriv_maxpos,deriv_meanval)
